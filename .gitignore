@@ -21,6 +21,10 @@ run_hook.bat
 __pycache__/
 *.py[cod]
 *.egg-info/
+.venv*/
+build/
+dist/
+*.spec
 
 # OS
 .DS_Store

@@ -8,7 +8,15 @@ import os
 import platform
 import sys
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _get_app_dir():
+    """返回可写的应用目录（优先 exe 所在目录，便于 PyInstaller 分发）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_FILE = os.path.join(_get_app_dir(), "config.json")
 
 _SYSTEM = platform.system().lower()
 
@@ -30,6 +38,10 @@ _DEFAULT = {
     "decoded_image_dir": "decoded_images",
     "decoded_voice_dir": "decoded_voices",
     "wechat_process": _DEFAULT_PROCESS,
+    # 本地服务配置（默认只监听本机，避免隐私泄露到局域网）
+    "listen_host": "127.0.0.1",
+    "listen_port": 5678,
+    "open_browser": True,
 }
 
 
@@ -200,7 +212,7 @@ def load_config():
         cfg = {**_DEFAULT, **cfg}
 
     # 将相对路径转为绝对路径
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.dirname(os.path.abspath(CONFIG_FILE))
     for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "decoded_voice_dir"):
         if key in cfg and not os.path.isabs(cfg[key]):
             cfg[key] = os.path.join(base, cfg[key])

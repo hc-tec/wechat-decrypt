@@ -4,5 +4,8 @@
     "decrypted_dir": "decrypted",
     "decoded_image_dir": "decoded_images",
     "decoded_voice_dir": "decoded_voices",
-    "wechat_process": "Weixin.exe"
+    "wechat_process": "Weixin.exe",
+    "listen_host": "127.0.0.1",
+    "listen_port": 5678,
+    "open_browser": true
 }

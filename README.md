@@ -107,6 +107,13 @@ Linux 版 `config.json` 示例：
 - 总延迟约 100ms
 - **图片消息内联预览**（支持旧 XOR / V1 / V2 三种 .dat 加密格式）
 
+### 本地服务 API（给其它应用调用）
+
+本项目在 Web UI 同一端口提供 HTTP API，用于上层应用（自动回复、个性化取数、画像等）读取联系人/会话/消息：
+
+- API 文档：`docs/API.md`
+- Windows 分发建议：`docs/DISTRIBUTION_WINDOWS.md`
+
 ### MCP Server (Claude AI 集成)
 
 将微信数据查询能力接入 [Claude Code](https://claude.ai/claude-code)，让 AI 直接读取你的微信消息。
