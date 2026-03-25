@@ -14,6 +14,7 @@ from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
 import zstandard as zstd
 from decode_image import ImageResolver
+from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
 
 # ============ 加密常量 ============
@@ -51,6 +52,12 @@ if not DECODED_IMAGE_DIR:
     DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, "decoded_images")
 elif not os.path.isabs(DECODED_IMAGE_DIR):
     DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, DECODED_IMAGE_DIR)
+
+DECODED_VOICE_DIR = _cfg.get("decoded_voice_dir")
+if not DECODED_VOICE_DIR:
+    DECODED_VOICE_DIR = os.path.join(SCRIPT_DIR, "decoded_voices")
+elif not os.path.isabs(DECODED_VOICE_DIR):
+    DECODED_VOICE_DIR = os.path.join(SCRIPT_DIR, DECODED_VOICE_DIR)
 
 with open(KEYS_FILE, encoding="utf-8") as f:
     ALL_KEYS = strip_key_metadata(json.load(f))
@@ -543,6 +550,8 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
 
     if base_type == 3:
         text = f"[图片] (local_id={local_id})"
+    elif base_type == 34:
+        text = f"[语音] (local_id={local_id})"
     elif base_type == 47:
         text = "[表情]"
     elif base_type == 50:
@@ -1491,6 +1500,73 @@ def get_new_messages() -> str:
 
 _image_resolver = ImageResolver(WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache)
 
+def _decode_voice(username: str, local_id: int):
+    media_rel = os.path.join("message", "media_0.db")
+    media_path = _cache.get(media_rel)
+    if not media_path:
+        return None, None, "找不到/无法解密 media_0.db"
+
+    try:
+        conn = sqlite3.connect(f"file:{media_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT v.create_time, v.data_index, v.voice_data "
+            "FROM VoiceInfo v "
+            "JOIN Name2Id n ON n.rowid = v.chat_name_id "
+            "WHERE n.user_name = ? AND v.local_id = ? "
+            "ORDER BY v.create_time DESC",
+            (username, local_id),
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        return None, None, f"查询 media_0.db 失败: {e}"
+
+    if not rows:
+        return None, None, f"未找到语音数据: local_id={local_id}"
+
+    target_ctime = rows[0][0]
+    parts = [(idx, blob) for ct, idx, blob in rows if ct == target_ctime and blob]
+    if not parts:
+        return None, None, f"语音数据为空: local_id={local_id}"
+
+    def _idx_key(v):
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    parts.sort(key=lambda x: _idx_key(x[0]))
+    voice_blob = b"".join(p[1] for p in parts)
+    if not voice_blob:
+        return None, None, f"语音数据为空: local_id={local_id}"
+
+    os.makedirs(DECODED_VOICE_DIR, exist_ok=True)
+    uname_hash = hashlib.md5(username.encode()).hexdigest()[:8]
+    wav_name = f"voice_{uname_hash}_{target_ctime}_{local_id}.wav"
+    wav_path = os.path.join(DECODED_VOICE_DIR, wav_name)
+    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+        return wav_path, target_ctime, None
+
+    tmp_path = wav_path + ".tmp"
+    out, src_fmt = decode_voice_bytes_to_wav(voice_blob, tmp_path)
+    if not out:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None, None, f"语音解码失败 (fmt={src_fmt})"
+
+    try:
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
+        os.replace(out, wav_path)
+    except OSError as e:
+        return None, None, f"保存 WAV 失败: {e}"
+
+    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+        return wav_path, target_ctime, None
+    return None, None, "保存 WAV 失败"
+
 
 @mcp.tool()
 def decode_image(chat_name: str, local_id: int) -> str:
@@ -1521,6 +1597,35 @@ def decode_image(chat_name: str, local_id: int) -> str:
         if 'md5' in result:
             error += f"\n  MD5: {result['md5']}"
         return f"解密失败: {error}"
+
+
+@mcp.tool()
+def decode_voice(chat_name: str, local_id: int) -> str:
+    """解码微信聊天中的一条语音消息为 WAV。
+
+    先用 get_chat_history 查看消息，语音消息会显示 local_id，
+    然后用此工具导出对应语音的 wav 文件。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 语音消息的 local_id（从 get_chat_history 获取）
+    """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    wav_path, ctime, err = _decode_voice(username, local_id)
+    if err:
+        return f"解码失败: {err}"
+
+    time_str = datetime.fromtimestamp(ctime).strftime('%Y-%m-%d %H:%M:%S') if ctime else ""
+    size = os.path.getsize(wav_path) if wav_path and os.path.exists(wav_path) else 0
+    return (
+        f"解码成功!\n"
+        f"  文件: {wav_path}\n"
+        f"  时间: {time_str}\n"
+        f"  大小: {size:,} bytes"
+    )
 
 
 @mcp.tool()
@@ -1563,6 +1668,52 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
         lines.append(line)
 
     return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def get_chat_voices(chat_name: str, limit: int = 20) -> str:
+    """列出某个聊天中的语音消息（含 local_id）。
+
+    可以配合 decode_voice 工具导出对应语音。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        limit: 返回数量，默认20
+    """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    names = get_contact_names()
+    display_name = names.get(username, username)
+
+    db_path, table_name = _find_msg_table_for_user(username)
+    if not db_path:
+        return f"找不到 {display_name} 的消息记录"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(f"""
+            SELECT local_id, create_time
+            FROM [{table_name}]
+            WHERE (local_type = 34 OR (local_type > 4294967296 AND local_type % 4294967296 = 34))
+            ORDER BY create_time DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+
+    if not rows:
+        return f"{display_name} 无语音消息"
+
+    lines = []
+    for local_id, create_time in rows:
+        time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M')
+        lines.append(f"[{time_str}] local_id={local_id}")
+
+    return f"{display_name} 的 {len(lines)} 条语音:\n\n" + "\n".join(lines)
 
 
 if __name__ == "__main__":

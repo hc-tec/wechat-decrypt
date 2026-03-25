@@ -28,6 +28,7 @@ _DEFAULT = {
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
     "decoded_image_dir": "decoded_images",
+    "decoded_voice_dir": "decoded_voices",
     "wechat_process": _DEFAULT_PROCESS,
 }
 
@@ -200,7 +201,7 @@ def load_config():
 
     # 将相对路径转为绝对路径
     base = os.path.dirname(os.path.abspath(__file__))
-    for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
+    for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "decoded_voice_dir"):
         if key in cfg and not os.path.isabs(cfg[key]):
             cfg[key] = os.path.join(base, cfg[key])
 
@@ -216,5 +217,8 @@ def load_config():
     # decoded_image_dir 默认值
     if "decoded_image_dir" not in cfg:
         cfg["decoded_image_dir"] = os.path.join(base, "decoded_images")
+    # decoded_voice_dir 默认值
+    if "decoded_voice_dir" not in cfg:
+        cfg["decoded_voice_dir"] = os.path.join(base, "decoded_voices")
 
     return cfg

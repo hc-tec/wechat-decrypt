@@ -2,5 +2,7 @@
     "db_dir": "D:\\xwechat_files\\your_wxid\\db_storage",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
+    "decoded_image_dir": "decoded_images",
+    "decoded_voice_dir": "decoded_voices",
     "wechat_process": "Weixin.exe"
 }

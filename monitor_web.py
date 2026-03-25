@@ -17,6 +17,7 @@ import urllib.parse
 import glob as glob_mod
 import zstandard as zstd
 from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_format
+from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, strip_key_metadata
 
 _zstd_dctx = zstd.ZstdDecompressor()
@@ -36,6 +37,7 @@ KEYS_FILE = _cfg["keys_file"]
 CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "contact", "contact.db")
 DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "session", "session.db")
 DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_images"))
+DECODED_VOICE_DIR = _cfg.get("decoded_voice_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_voices"))
 MONITOR_CACHE_DIR = os.path.join(_cfg["decrypted_dir"], "_monitor_cache")
 WECHAT_BASE_DIR = _cfg.get("wechat_base_dir", "")
 IMAGE_AES_KEY = _cfg.get("image_aes_key")  # V2 格式 AES key (从微信内存提取)
@@ -306,11 +308,11 @@ class MonitorDBCache:
             return out_path
 
 
-def build_username_db_map():
-    """从已解密的 Name2Id 表构建 username → [db_keys] 映射
+def build_username_db_map(db_cache, keys):
+    """从 message_N.db 的 Name2Id 表构建 username → [db_keys] 映射
 
-    同一个 username 可能存在于多个 message_N.db 中,
-    按 DB 文件修改时间倒序排列（最新的排前面）。
+    同一个 username 可能存在于多个 message_N.db 中，按 DB 文件修改时间倒序排列（最新的排前面）。
+    通过 db_cache 动态解密 message_N.db，不依赖已全量解密的 decrypted/message 目录。
     """
     # 先获取每个 DB 的 mtime 用于排序
     db_mtimes = {}
@@ -323,12 +325,13 @@ def build_username_db_map():
             db_mtimes[rel_key] = 0
 
     mapping = {}  # username → [db_keys], 最新的在前
-    decrypted_msg_dir = os.path.join(_cfg["decrypted_dir"], "message")
     for i in range(5):
-        db_path = os.path.join(decrypted_msg_dir, f"message_{i}.db")
-        if not os.path.exists(db_path):
-            continue
         rel_key = os.path.join("message", f"message_{i}.db")
+        if not get_key_info(keys, rel_key):
+            continue
+        db_path = db_cache.get(rel_key)
+        if not db_path:
+            continue
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             for row in conn.execute("SELECT user_name FROM Name2Id").fetchall():
@@ -337,7 +340,7 @@ def build_username_db_map():
                 mapping[row[0]].append(rel_key)
             conn.close()
         except Exception as e:
-            print(f"  [WARN] Name2Id message_{i}.db: {e}", flush=True)
+            print(f"  [WARN] Name2Id {rel_key}: {e}", flush=True)
 
     # 对每个 username 的 db_keys 按 mtime 倒序（最新的优先）
     for username in mapping:
@@ -722,6 +725,130 @@ class SessionMonitor:
 
         print(f"  [img] 所有 .dat 均无法解密", flush=True)
         return '__v2_unsupported__'
+
+    def resolve_voice(self, username, timestamp):
+        """解码语音: username+timestamp → 解码后的 wav 文件名，失败返回 None"""
+        if not self.db_cache or not self.username_db_map:
+            return None
+
+        db_keys = self.username_db_map.get(username)
+        if not db_keys:
+            return None
+
+        table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
+        local_id = None
+        msg_ctime = None
+        for db_key in db_keys:
+            for _try in range(2):
+                msg_db_path = self.db_cache.get(db_key)
+                if not msg_db_path:
+                    break
+                try:
+                    conn = sqlite3.connect(f"file:{msg_db_path}?mode=ro", uri=True)
+                    row = conn.execute(f"""
+                        SELECT local_id, create_time FROM [{table_name}]
+                        WHERE (local_type = 34 OR (local_type > 4294967296 AND local_type % 4294967296 = 34))
+                        AND create_time = ?
+                        ORDER BY local_id DESC LIMIT 1
+                    """, (timestamp,)).fetchone()
+                    if not row:
+                        row = conn.execute(f"""
+                            SELECT local_id, create_time FROM [{table_name}]
+                            WHERE (local_type = 34 OR (local_type > 4294967296 AND local_type % 4294967296 = 34))
+                            AND ABS(create_time - ?) <= 3
+                            ORDER BY ABS(create_time - ?) LIMIT 1
+                        """, (timestamp, timestamp)).fetchone()
+                    conn.close()
+                    if row:
+                        local_id, msg_ctime = row
+                    break
+                except Exception as e:
+                    if 'malformed' in str(e) and _try == 0:
+                        print(f"  [voice] {db_key} malformed, 强制刷新...", flush=True)
+                        self.db_cache.invalidate(db_key)
+                        continue
+                    if 'no such table' not in str(e):
+                        print(f"  [voice] 查询 {db_key}/{table_name} 失败: {e}", flush=True)
+                    break
+            if local_id:
+                break
+
+        if not local_id:
+            print(f"  [voice] 未找到 local_id: {username} t={timestamp}", flush=True)
+            return None
+
+        media_rel = os.path.join("message", "media_0.db")
+        media_path = self.db_cache.get(media_rel)
+        if not media_path:
+            print(f"  [voice] media_0.db 解密失败/不存在", flush=True)
+            return None
+
+        try:
+            conn = sqlite3.connect(f"file:{media_path}?mode=ro", uri=True)
+            rows = conn.execute(
+                "SELECT v.create_time, v.data_index, v.voice_data "
+                "FROM VoiceInfo v "
+                "JOIN Name2Id n ON n.rowid = v.chat_name_id "
+                "WHERE n.user_name = ? AND v.local_id = ? AND ABS(v.create_time - ?) <= 3 "
+                "ORDER BY v.create_time DESC",
+                (username, local_id, msg_ctime or timestamp),
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"  [voice] 查询 media_0.db 失败: {e}", flush=True)
+            return None
+
+        if not rows:
+            print(f"  [voice] 未找到语音数据: local_id={local_id} t={msg_ctime or timestamp}", flush=True)
+            return None
+
+        target_ctime = rows[0][0]
+        parts = [(idx, blob) for ct, idx, blob in rows if ct == target_ctime and blob]
+        if not parts:
+            return None
+
+        def _idx_key(v):
+            try:
+                return int(v)
+            except Exception:
+                return 0
+
+        parts.sort(key=lambda x: _idx_key(x[0]))
+        voice_blob = b"".join(p[1] for p in parts)
+        if not voice_blob:
+            return None
+
+        os.makedirs(DECODED_VOICE_DIR, exist_ok=True)
+        uname_hash = hashlib.md5(username.encode()).hexdigest()[:8]
+        wav_name = f"voice_{uname_hash}_{target_ctime}_{local_id}.wav"
+        wav_path = os.path.join(DECODED_VOICE_DIR, wav_name)
+
+        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+            return wav_name
+
+        tmp_path = wav_path + ".tmp"
+        out, src_fmt = decode_voice_bytes_to_wav(voice_blob, tmp_path)
+        if not out:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            print(f"  [voice] 解码失败: local_id={local_id} fmt={src_fmt}", flush=True)
+            return None
+
+        try:
+            if os.path.exists(wav_path):
+                os.unlink(wav_path)
+            os.replace(out, wav_path)
+        except OSError:
+            pass
+
+        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+            print(f"  [voice] 解码成功: {wav_name}", flush=True)
+            return wav_name
+
+        return None
 
     def _async_resolve_image(self, username, timestamp, msg_data):
         """后台线程: 解密图片并通过 SSE 推送更新"""
@@ -1189,10 +1316,17 @@ class SessionMonitor:
                 if voice is None:
                     return None
                 length_ms = int(voice.get('voicelength') or 0)
-                return {
+                info = {
                     'type': 'voice',
                     'duration': round(length_ms / 1000, 1),
                 }
+                try:
+                    wav_name = self.resolve_voice(username, timestamp)
+                    if wav_name:
+                        info['voice_url'] = f'/voice/{wav_name}'
+                except Exception as e:
+                    print(f"  [voice] resolve failed: {e}", flush=True)
+                return info
             except ET.ParseError:
                 pass
             return None
@@ -1465,7 +1599,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .msg-file-icon{font-size:24px}
 .msg-file-name{font-size:13px;color:#ccc}
 .msg-file-size{font-size:11px;color:#666}
-.msg-voice{display:inline-flex;align-items:center;gap:6px;background:rgba(76,175,80,.1);border:1px solid rgba(76,175,80,.2);border-radius:16px;padding:6px 14px;margin-top:4px}
+.msg-voice{display:inline-flex;align-items:center;gap:8px;background:rgba(76,175,80,.1);border:1px solid rgba(76,175,80,.2);border-radius:16px;padding:6px 14px;margin-top:4px}
+.msg-voice audio{height:26px;max-width:260px}
 .msg-video{display:inline-flex;align-items:center;gap:6px;background:rgba(79,195,247,.08);border:1px solid rgba(79,195,247,.15);border-radius:8px;padding:6px 12px;margin-top:4px}
 .msg-chatlog{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 12px;margin-top:4px;max-width:450px}
 .chatlog-body{margin-top:6px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px}
@@ -1587,7 +1722,11 @@ function renderRich(r){
     }
     return `<div class="msg-chatlog"><div class="msg-link-title">📋 ${esc(r.title)}</div>${body}</div>`;
   }
-  if(r.type==='voice') return `<div class="msg-voice">🎤 语音 ${r.duration}s</div>`;
+  if(r.type==='voice'){
+    const d=(r.duration!=null)?` ${r.duration}s`:``;
+    if(r.voice_url) return `<div class="msg-voice"><audio controls preload="none" src="${r.voice_url}"></audio><span style="color:#9f9">${d}</span></div>`;
+    return `<div class="msg-voice">🎤 语音${d}</div>`;
+  }
   if(r.type==='video') return `<div class="msg-video">🎬 视频${r.duration?' '+r.duration+'s':''}</div>`;
   return null;
 }
@@ -1844,6 +1983,32 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+        elif self.path.startswith('/voice/'):
+            filename = urllib.parse.unquote(self.path[7:])
+            # 安全: 防目录穿越
+            if '/' in filename or '\\' in filename or '..' in filename:
+                self.send_error(403)
+                return
+            filepath = os.path.join(DECODED_VOICE_DIR, filename)
+            if not os.path.isfile(filepath):
+                self.send_error(404)
+                return
+            ext = os.path.splitext(filename)[1].lower()
+            ct = {
+                '.wav': 'audio/wav',
+                '.mp3': 'audio/mpeg',
+                '.amr': 'audio/amr',
+                '.ogg': 'audio/ogg',
+            }.get(ext, 'application/octet-stream')
+            with open(filepath, 'rb') as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', ct)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'public, max-age=86400')
+            self.end_headers()
+            self.wfile.write(data)
+
         elif self.path == '/stream':
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -1897,10 +2062,6 @@ def main():
     contact_names = load_contact_names()
     print(f"已加载 {len(contact_names)} 个联系人", flush=True)
 
-    print("构建 username→DB 映射...", flush=True)
-    username_db_map = build_username_db_map()
-    print(f"已映射 {len(username_db_map)} 个用户名", flush=True)
-
     # 启动时清理可能损坏的缓存
     if os.path.isdir(MONITOR_CACHE_DIR):
         for f in os.listdir(MONITOR_CACHE_DIR):
@@ -1918,6 +2079,10 @@ def main():
                         print(f"[cleanup] 缓存被占用跳过: {f}", flush=True)
 
     db_cache = MonitorDBCache(keys, MONITOR_CACHE_DIR)
+
+    print("构建 username→DB 映射...", flush=True)
+    username_db_map = build_username_db_map(db_cache, keys)
+    print(f"已映射 {len(username_db_map)} 个用户名", flush=True)
 
     # 后台预热所有 message DB（图片/emoji 解密必需）
     def _warmup():
