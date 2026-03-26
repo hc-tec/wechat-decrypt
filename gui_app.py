@@ -154,7 +154,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._guide = QtWidgets.QTextBrowser()
         self._guide.setOpenExternalLinks(True)
         self._guide.setReadOnly(True)
-        self._guide.setMaximumHeight(190)
+        # 该区域用于给非技术用户“可见且稳定”的引导高度；否则初次布局时可能被挤压到几乎看不见，
+        # 直到触发一次布局重算（例如展开/收起高级设置）才恢复正常。
+        self._guide.setMinimumHeight(170)
+        self._guide.setMaximumHeight(220)
+        try:
+            self._guide.setSizeAdjustPolicy(
+                QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+            )
+        except Exception:
+            pass
         guide_l.addWidget(self._guide)
         layout.addWidget(guide_group)
 
@@ -430,6 +439,13 @@ class MainWindow(QtWidgets.QMainWindow):
         </div>
         """
         self._guide.setHtml(html)
+        try:
+            self._guide.document().adjustSize()
+            self._guide.updateGeometry()
+            if self.centralWidget() and self.centralWidget().layout():
+                self.centralWidget().layout().activate()
+        except Exception:
+            pass
 
     def save_config(self):
         cfg = read_config_file(self._config_path)
