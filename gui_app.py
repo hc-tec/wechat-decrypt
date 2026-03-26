@@ -1,6 +1,7 @@
 import os
 import sys
 import urllib.request
+import re
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
@@ -9,6 +10,7 @@ from qt_compat import QT_LIB, QtCore, QtGui, QtWidgets
 
 APP_TITLE = "WeChat Data Service"
 AUTOSTART_VALUE_NAME = "WeChatDataService"
+_RE_ACCOUNT_DIR_WITH_SUFFIX = re.compile(r"(.+)_([0-9a-fA-F]{4,})$")
 
 
 def _is_frozen() -> bool:
@@ -55,6 +57,26 @@ def _can_open_url(url: str) -> bool:
             return resp.status == 200
     except Exception:
         return False
+
+
+def _suggest_self_username_from_db_dir(db_dir: str) -> str:
+    db_dir = (db_dir or "").strip()
+    if not db_dir:
+        return ""
+
+    base_dir = db_dir
+    if os.path.basename(base_dir) == "db_storage":
+        base_dir = os.path.dirname(base_dir)
+
+    account_dir = os.path.basename(base_dir).strip()
+    if not account_dir:
+        return ""
+
+    m = _RE_ACCOUNT_DIR_WITH_SUFFIX.fullmatch(account_dir)
+    if m:
+        return m.group(1)
+
+    return account_dir
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -126,6 +148,16 @@ class MainWindow(QtWidgets.QMainWindow):
         autostart_l.addStretch(1)
         layout.addWidget(autostart_group)
 
+        # Guide
+        guide_group = QtWidgets.QGroupBox("使用引导（常见问题与小技巧）")
+        guide_l = QtWidgets.QVBoxLayout(guide_group)
+        self._guide = QtWidgets.QTextBrowser()
+        self._guide.setOpenExternalLinks(True)
+        self._guide.setReadOnly(True)
+        self._guide.setMaximumHeight(190)
+        guide_l.addWidget(self._guide)
+        layout.addWidget(guide_group)
+
         # Service controls
         svc_group = QtWidgets.QGroupBox("服务")
         svc_l = QtWidgets.QGridLayout(svc_group)
@@ -185,9 +217,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._open_browser = QtWidgets.QCheckBox("启动后自动打开浏览器")
 
+        self._self_username = QtWidgets.QLineEdit()
+        self._btn_guess_self = QtWidgets.QPushButton("自动填充")
+        self._btn_guess_self.clicked.connect(self.guess_self_username)
+        self._self_hint = QtWidgets.QLabel("用于判断哪些消息是“我发的”，避免自动回复自己。")
+        self._self_hint.setObjectName("hint")
+        self._self_hint.setWordWrap(True)
+
         self._api_token = QtWidgets.QLineEdit()
         self._api_token.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self._self_username = QtWidgets.QLineEdit()
+        self._image_aes_key = QtWidgets.QLineEdit()
+        self._image_xor_key = QtWidgets.QLineEdit()
 
         self._btn_save = QtWidgets.QPushButton("保存配置")
         self._btn_save.clicked.connect(self.save_config)
@@ -205,6 +245,14 @@ class MainWindow(QtWidgets.QMainWindow):
         basic_l.addWidget(QtWidgets.QLabel("db_dir"), row, 0)
         basic_l.addWidget(self._db_dir, row, 1, 1, 2)
         basic_l.addWidget(self._btn_pick_db, row, 3)
+
+        row += 1
+        basic_l.addWidget(QtWidgets.QLabel("self_username"), row, 0)
+        basic_l.addWidget(self._self_username, row, 1, 1, 2)
+        basic_l.addWidget(self._btn_guess_self, row, 3)
+
+        row += 1
+        basic_l.addWidget(self._self_hint, row, 1, 1, 3)
 
         row += 1
         basic_l.addWidget(self._open_browser, row, 1)
@@ -239,8 +287,12 @@ class MainWindow(QtWidgets.QMainWindow):
         adv_l.addWidget(self._api_token, row, 1, 1, 3)
 
         row += 1
-        adv_l.addWidget(QtWidgets.QLabel("self_username（可选）"), row, 0)
-        adv_l.addWidget(self._self_username, row, 1, 1, 3)
+        adv_l.addWidget(QtWidgets.QLabel("image_aes_key（图片 V2）"), row, 0)
+        adv_l.addWidget(self._image_aes_key, row, 1, 1, 3)
+
+        row += 1
+        adv_l.addWidget(QtWidgets.QLabel("image_xor_key（图片 V2）"), row, 0)
+        adv_l.addWidget(self._image_xor_key, row, 1, 1, 3)
 
         adv_root = QtWidgets.QVBoxLayout(self._advanced_group)
         adv_root.setContentsMargins(12, 10, 12, 10)
@@ -284,6 +336,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 padding: 7px;
                 color: #e8eaf0;
             }
+            QTextBrowser {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px;
+                padding: 10px;
+                color: #e8eaf0;
+            }
             QPushButton {
                 background: rgba(79,195,247,0.14);
                 border: 1px solid rgba(79,195,247,0.35);
@@ -313,6 +372,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_token.setText(cfg.get("api_token", "") or "")
         self._self_username.setText(cfg.get("self_username", "") or "")
 
+        self._image_aes_key.setText(cfg.get("image_aes_key", "") or "")
+        xor_val = cfg.get("image_xor_key", "")
+        if isinstance(xor_val, int):
+            self._image_xor_key.setText(f"0x{xor_val:02X}")
+        else:
+            self._image_xor_key.setText(str(xor_val or "").strip())
+
+        suggested_self = _suggest_self_username_from_db_dir(cfg.get("db_dir", "") or "")
+        if suggested_self:
+            self._self_username.setPlaceholderText(suggested_self)
+        else:
+            self._self_username.setPlaceholderText("例如：wxid_xxx")
+
         host = (cfg.get("listen_host") or "127.0.0.1").strip() or "127.0.0.1"
         port = int(cfg.get("listen_port") or 5678)
         url_host = "localhost" if host in ("0.0.0.0", "127.0.0.1", "::") else host
@@ -322,6 +394,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self._hint.setText("检测到未配置 db_dir：请先选择微信 db_storage 目录，然后保存配置。")
         else:
             self._hint.setText("提示：首次运行提取密钥可能需要管理员权限（右键“以管理员身份运行”）。")
+
+        self._refresh_guide_text()
+
+    def _refresh_guide_text(self):
+        cfg = self._cfg or {}
+        db_dir = (cfg.get("db_dir") or "").strip()
+        suggested_self = _suggest_self_username_from_db_dir(db_dir)
+        self_u = (cfg.get("self_username") or "").strip()
+        image_aes = (cfg.get("image_aes_key") or "").strip()
+
+        status_self = "已填写" if self_u else ("未填写（建议填写）" if suggested_self else "未填写")
+        status_img = "已配置" if image_aes else "未配置（微信 4.0 / 2025-08+ 可能需要）"
+
+        html = f"""
+        <div style="line-height:1.5">
+          <b>快速开始</b>
+          <ol style="margin-top:6px;margin-bottom:10px;">
+            <li>先启动微信并保持登录。</li>
+            <li>在“配置”里选择 <code>db_dir</code>（一般形如：<code>...\\xwechat_files\\&lt;wxid&gt;\\db_storage</code>）。</li>
+            <li>确认 <code>self_username</code>（用于判断“我发的消息”，避免自动回复自己）。</li>
+            <li>点击“启动服务” → “打开 Web UI”。</li>
+          </ol>
+          <b>小技巧</b>
+          <ul style="margin-top:6px;margin-bottom:10px;">
+            <li>密钥提取失败：尝试点击“以管理员身份重启”，并确保微信窗口已打开。</li>
+            <li>多账号：请确保 <code>db_dir</code> 对应当前登录账号；<code>self_username</code> 通常等于 <code>db_dir</code> 上一级文件夹名。</li>
+          </ul>
+          <b>图片解密/预览（V2）</b>
+          <ul style="margin-top:6px;margin-bottom:0;">
+            <li>状态：<code>image_aes_key</code> {status_img}</li>
+            <li>步骤：先在微信里“点开查看 2-3 张图片（大图）”，再运行图片密钥提取（README 里有 <code>find_image_key_monitor.py</code> / <code>find_image_key.py</code>），成功后重启服务。</li>
+          </ul>
+          <div style="margin-top:8px;color:#9aa3c7;">当前：self_username {status_self}{('，建议值：<code>'+suggested_self+'</code>') if (not self_u and suggested_self) else ''}</div>
+        </div>
+        """
+        self._guide.setHtml(html)
 
     def save_config(self):
         cfg = read_config_file(self._config_path)
@@ -334,6 +442,25 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg["open_browser"] = bool(self._open_browser.isChecked())
         cfg["api_token"] = (self._api_token.text() or "").strip()
         cfg["self_username"] = (self._self_username.text() or "").strip()
+
+        aes = (self._image_aes_key.text() or "").strip()
+        if aes:
+            cfg["image_aes_key"] = aes
+        else:
+            cfg.pop("image_aes_key", None)
+
+        xor_text = (self._image_xor_key.text() or "").strip()
+        if xor_text:
+            try:
+                xor_val = int(xor_text, 16) if xor_text.lower().startswith("0x") else int(xor_text, 10)
+                if xor_val < 0 or xor_val > 255:
+                    raise ValueError("out of range")
+                cfg["image_xor_key"] = xor_val
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "配置错误", "image_xor_key 必须是 0-255 的数字（支持 0xA2 这种十六进制）。")
+                return
+        else:
+            cfg.pop("image_xor_key", None)
 
         try:
             write_config_file(cfg, self._config_path)
@@ -349,6 +476,20 @@ class MainWindow(QtWidgets.QMainWindow):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "选择 db_storage 目录", start)
         if d:
             self._db_dir.setText(d)
+
+    def guess_self_username(self):
+        suggested = _suggest_self_username_from_db_dir(self._db_dir.text())
+        if not suggested:
+            QtWidgets.QMessageBox.information(self, "提示", "无法从当前 db_dir 推导 self_username，请手动填写。")
+            return
+
+        current = (self._self_username.text() or "").strip()
+        if current and current != suggested:
+            r = QtWidgets.QMessageBox.question(self, "确认覆盖", f"当前 self_username = {current}\n建议值 = {suggested}\n\n是否用建议值覆盖？")
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        self._self_username.setText(suggested)
 
     def open_config_folder(self):
         folder = os.path.dirname(os.path.abspath(self._config_path))
@@ -366,6 +507,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not db_dir or not os.path.isdir(db_dir):
             QtWidgets.QMessageBox.warning(self, "配置不完整", "db_dir 无效，请先选择微信 db_storage 目录。")
             return
+
+        if not (cfg.get("self_username") or "").strip():
+            suggested = _suggest_self_username_from_db_dir(db_dir)
+            hint = f"\n建议值：{suggested}" if suggested else ""
+            r = QtWidgets.QMessageBox.question(
+                self,
+                "建议填写 self_username",
+                "self_username 为空：消息方向（我发/对方发）可能不准确，自动回复也可能误判。\n"
+                f"你可以点击“自动填充”或手动填写。{hint}\n\n仍然启动服务？",
+            )
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
 
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
