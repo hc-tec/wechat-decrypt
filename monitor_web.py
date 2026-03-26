@@ -2384,6 +2384,82 @@ class Handler(BaseHTTPRequestHandler):
 
             self._send_json(200, {"items": items, "limit": limit, "offset": offset})
 
+        elif path.startswith("/api/v1/people/"):
+            parts = path.strip("/").split("/")
+            # /api/v1/people/{username}/profile
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "profile":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                store = getattr(self.__class__, "persona_store", None)
+                if not store:
+                    self.send_error(503, "persona store not ready")
+                    return
+                try:
+                    profile = store.get_profile(username)
+                    store.record_recent_contact(username)
+                except Exception as e:
+                    self.send_error(500, f"profile failed: {e}")
+                    return
+
+                names = getattr(self.__class__, "contact_names", {}) or {}
+                full = getattr(self.__class__, "contact_full", []) or []
+                full_map = {c.get("username"): c for c in full if c.get("username")}
+                base = full_map.get(username) or {
+                    "username": username,
+                    "nick_name": "",
+                    "remark": "",
+                    "display_name": names.get(username, username),
+                    "is_group": ("@chatroom" in username),
+                }
+                base = dict(base)
+                base["avatar_url"] = f"/avatar/{urllib.parse.quote(username, safe='')}"
+                self._send_json(200, {"contact": base, "profile": profile})
+                return
+
+            # /api/v1/people/{username}/memories
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "memories":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                store = getattr(self.__class__, "persona_store", None)
+                if not store:
+                    self.send_error(503, "persona store not ready")
+                    return
+                kind = (qs.get("kind", [""])[0] or "").strip()
+                status = (qs.get("status", ["active"])[0] or "active").strip()
+                q = (qs.get("q", [""])[0] or "").strip()
+                try:
+                    limit = int((qs.get("limit", ["50"])[0] or "50").strip())
+                except Exception:
+                    limit = 50
+                try:
+                    offset = int((qs.get("offset", ["0"])[0] or "0").strip())
+                except Exception:
+                    offset = 0
+
+                try:
+                    result = store.list_memories(
+                        username=username,
+                        kind=kind,
+                        status=status,
+                        q=q,
+                        limit=limit,
+                        offset=offset,
+                    )
+                    store.record_recent_contact(username)
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"memories failed: {e}")
+                    return
+
+                self._send_json(200, {"username": username, **result})
+                return
+
         elif path == '/api/v1/messages':
             try:
                 limit = int((qs.get("limit", ["200"])[0] or "200").strip())
@@ -2759,6 +2835,115 @@ class Handler(BaseHTTPRequestHandler):
             store.record_recent_contact(username, ts=ts)
             self._send_json(200, {"ok": True})
             return
+
+        if path.startswith("/api/v1/people/") and path.endswith("/memories"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "memories":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                store = getattr(self.__class__, "persona_store", None)
+                if not store:
+                    self.send_error(503, "persona store not ready")
+                    return
+                try:
+                    payload = self._read_json_body()
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                try:
+                    res = store.create_memory(username, payload if isinstance(payload, dict) else {})
+                    store.record_recent_contact(username)
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"create memory failed: {e}")
+                    return
+                self._send_json(200, {"ok": True, **res})
+                return
+
+        self.send_error(404)
+
+    def do_PATCH(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        store = getattr(self.__class__, "persona_store", None)
+        if not store:
+            self.send_error(503, "persona store not ready")
+            return
+
+        if path.startswith("/api/v1/people/") and path.endswith("/profile"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "profile":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                try:
+                    patch = self._read_json_body() or {}
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                try:
+                    profile = store.patch_profile(username, patch if isinstance(patch, dict) else {})
+                    store.record_recent_contact(username)
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"patch profile failed: {e}")
+                    return
+                self._send_json(200, {"ok": True, "profile": profile})
+                return
+
+        if path.startswith("/api/v1/memories/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[0:3] == ["api", "v1", "memories"]:
+                mem_id = urllib.parse.unquote(parts[3] or "").strip()
+                try:
+                    patch = self._read_json_body() or {}
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                try:
+                    store.patch_memory(mem_id, patch if isinstance(patch, dict) else {})
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"patch memory failed: {e}")
+                    return
+                self._send_json(200, {"ok": True})
+                return
+
+        self.send_error(404)
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        store = getattr(self.__class__, "persona_store", None)
+        if not store:
+            self.send_error(503, "persona store not ready")
+            return
+
+        if path.startswith("/api/v1/memories/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[0:3] == ["api", "v1", "memories"]:
+                mem_id = urllib.parse.unquote(parts[3] or "").strip()
+                try:
+                    store.patch_memory(mem_id, {"status": "invalidated"})
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"delete memory failed: {e}")
+                    return
+                self._send_json(200, {"ok": True})
+                return
 
         self.send_error(404)
 

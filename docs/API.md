@@ -97,3 +97,31 @@ SSE 实时推送（浏览器 EventSource 兼容）。普通消息走默认 `mess
 ```json
 {"username":"wxid_xxx","display_name":"同事","items":[{"local_id":1,"timestamp":1710000000,"base_type":1,"text":"晚上吃啥","raw":"晚上吃啥"}]}
 ```
+
+## 人物画像与记忆（不含 AI，仅存取）
+
+存储文件：`persona_db`（默认 `persona.db`）。
+
+### `GET /api/v1/people/{username}/profile`
+
+获取画像（并返回联系人基础信息 `contact`）。
+
+### `PATCH /api/v1/people/{username}/profile`
+
+更新画像字段：`tags` / `notes` / `auto_reply_policy`。
+
+### `GET /api/v1/people/{username}/memories?kind=&status=active&q=&limit=50&offset=0`
+
+列出记忆条目（支持按 kind/status 搜索与分页）。
+
+### `POST /api/v1/people/{username}/memories`
+
+新增记忆条目（示例字段：`kind`/`key`/`value`/`importance`/`confidence`/`status`/`source`/`evidence`/`expires_at`）。
+
+### `PATCH /api/v1/memories/{id}`
+
+更新记忆条目（同上字段，按需传递）。
+
+### `DELETE /api/v1/memories/{id}`
+
+软删除：将条目标记为 `invalidated`。
