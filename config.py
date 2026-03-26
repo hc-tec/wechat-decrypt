@@ -66,7 +66,8 @@ def _choose_candidate(candidates):
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
-        if not sys.stdin.isatty():
+        stdin = getattr(sys, "stdin", None)
+        if not stdin or not getattr(stdin, "isatty", lambda: False)():
             return candidates[0]
         print("[!] 检测到多个微信数据目录（请选择当前正在运行的微信账号）:")
         for i, c in enumerate(candidates, 1):
