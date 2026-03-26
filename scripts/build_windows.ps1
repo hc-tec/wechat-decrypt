@@ -3,6 +3,13 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+# 避免上一次运行的 exe 占用 dist 内 DLL，导致 PyInstaller 清理失败
+try {
+  Stop-Process -Name "WeChatDataServiceGUI","WeChatDataServiceGUIConsole","WeChatDataService" -Force -ErrorAction SilentlyContinue
+} catch {
+  # ignore
+}
+
 if (!(Test-Path ".venv-build")) {
   py -m venv .venv-build
 }
