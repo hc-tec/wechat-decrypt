@@ -37,6 +37,7 @@ _DEFAULT = {
     "decrypted_dir": "decrypted",
     "decoded_image_dir": "decoded_images",
     "decoded_voice_dir": "decoded_voices",
+    "persona_db": "persona.db",
     "wechat_process": _DEFAULT_PROCESS,
     # 本地服务配置（默认只监听本机，避免隐私泄露到局域网）
     "listen_host": "127.0.0.1",
@@ -213,7 +214,7 @@ def load_config():
 
     # 将相对路径转为绝对路径
     base = os.path.dirname(os.path.abspath(CONFIG_FILE))
-    for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "decoded_voice_dir"):
+    for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "decoded_voice_dir", "persona_db"):
         if key in cfg and not os.path.isabs(cfg[key]):
             cfg[key] = os.path.join(base, cfg[key])
 

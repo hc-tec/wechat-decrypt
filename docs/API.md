@@ -34,7 +34,29 @@
 
 响应示例：
 ```json
-{"items":[{"username":"wxid_xxx","nick_name":"张三","remark":"同事","display_name":"同事","is_group":false}]}
+{"items":[{"username":"wxid_xxx","nick_name":"张三","remark":"同事","display_name":"同事","is_group":false,"avatar_url":"/avatar/wxid_xxx"}]}
+```
+
+### `GET /api/v1/recent_contacts?limit=20&offset=0`
+
+最近查询过的联系人（服务端只负责保存；前端按需拉取数量/分页）。
+
+记录方式：
+- 调用 `GET /api/v1/chats/{username}/history` 会自动记录
+- 或手动调用 `POST /api/v1/recent_contacts`
+
+响应示例：
+```json
+{"items":[{"username":"wxid_xxx","display_name":"同事","last_access_ts":1710000000,"access_count":3,"avatar_url":"/avatar/wxid_xxx"}],"limit":20,"offset":0}
+```
+
+### `POST /api/v1/recent_contacts`
+
+手动记录一次“最近查询联系人”。
+
+请求示例：
+```json
+{"username":"wxid_xxx"}
 ```
 
 ### `GET /api/v1/sessions?limit=50`
@@ -43,8 +65,12 @@
 
 响应示例：
 ```json
-{"items":[{"username":"wxid_xxx","display_name":"同事","unread":0,"last_timestamp":1710000000,"last_msg_type":1,"summary":"晚上吃啥"}]}
+{"items":[{"username":"wxid_xxx","display_name":"同事","avatar_url":"/avatar/wxid_xxx","unread":0,"last_timestamp":1710000000,"last_msg_type":1,"summary":"晚上吃啥"}]}
 ```
+
+### `GET /avatar/{username}`
+
+联系人头像（从 `head_image/head_image.db` 读取）。
 
 ## 实时消息（给自动回复程序用）
 
@@ -71,4 +97,3 @@ SSE 实时推送（浏览器 EventSource 兼容）。普通消息走默认 `mess
 ```json
 {"username":"wxid_xxx","display_name":"同事","items":[{"local_id":1,"timestamp":1710000000,"base_type":1,"text":"晚上吃啥","raw":"晚上吃啥"}]}
 ```
-

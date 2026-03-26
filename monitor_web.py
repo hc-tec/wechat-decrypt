@@ -19,6 +19,7 @@ import zstandard as zstd
 from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_format
 from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, strip_key_metadata
+from persona_store import PersonaStore
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -38,6 +39,9 @@ CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "contact", "contact.db")
 DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "session", "session.db")
 DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_images"))
 DECODED_VOICE_DIR = _cfg.get("decoded_voice_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_voices"))
+PERSONA_DB = _cfg.get("persona_db") or os.path.join(os.path.dirname(KEYS_FILE), "persona.db")
+if not os.path.isabs(PERSONA_DB):
+    PERSONA_DB = os.path.join(os.path.dirname(KEYS_FILE), PERSONA_DB)
 MONITOR_CACHE_DIR = os.path.join(_cfg["decrypted_dir"], "_monitor_cache")
 WECHAT_BASE_DIR = _cfg.get("wechat_base_dir", "")
 IMAGE_AES_KEY = _cfg.get("image_aes_key")  # V2 格式 AES key (从微信内存提取)
@@ -2159,6 +2163,32 @@ class Handler(BaseHTTPRequestHandler):
     contact_full = []
     db_cache = None
     username_db_map = {}
+    persona_store = None
+
+    def _send_json(self, status_code, payload):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json_body(self, max_bytes=1024 * 1024):
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except Exception:
+            length = 0
+        if length <= 0:
+            return None
+        if length > max_bytes:
+            raise ValueError("body too large")
+        raw = self.rfile.read(length)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise ValueError("invalid json")
 
     def log_message(self, *a): pass
     def handle(self):
@@ -2235,13 +2265,14 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 items = [c for c in items if _hit(c)]
 
-            payload = {"items": items[:limit]}
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            def _with_avatar(c):
+                c2 = dict(c)
+                uname = c2.get("username", "") or ""
+                c2["avatar_url"] = f"/avatar/{urllib.parse.quote(uname, safe='')}" if uname else ""
+                return c2
+
+            payload = {"items": [_with_avatar(c) for c in items[:limit]]}
+            self._send_json(200, payload)
 
         elif path == '/api/v1/sessions':
             try:
@@ -2290,6 +2321,7 @@ class Handler(BaseHTTPRequestHandler):
                     "username": username,
                     "display_name": display,
                     "is_group": is_group,
+                    "avatar_url": f"/avatar/{urllib.parse.quote(username, safe='')}" if username else "",
                     "unread": unread or 0,
                     "last_timestamp": ts or 0,
                     "last_msg_type": msg_type or 0,
@@ -2299,13 +2331,58 @@ class Handler(BaseHTTPRequestHandler):
                     "sender_display_name": sender_display or "",
                 })
 
-            payload = {"items": items}
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_json(200, {"items": items})
+
+        elif path == "/api/v1/recent_contacts":
+            try:
+                limit = int((qs.get("limit", ["20"])[0] or "20").strip())
+            except Exception:
+                limit = 20
+            limit = max(1, min(limit, 500))
+
+            try:
+                offset = int((qs.get("offset", ["0"])[0] or "0").strip())
+            except Exception:
+                offset = 0
+            offset = max(0, offset)
+
+            store = getattr(self.__class__, "persona_store", None)
+            if not store:
+                self._send_json(200, {"items": [], "limit": limit, "offset": offset})
+                return
+
+            try:
+                rec = store.list_recent_contacts(limit=limit, offset=offset)
+            except Exception as e:
+                self.send_error(500, f"recent_contacts failed: {e}")
+                return
+
+            names = getattr(self.__class__, "contact_names", {}) or {}
+            full = getattr(self.__class__, "contact_full", []) or []
+            full_map = {c.get("username"): c for c in full if c.get("username")}
+
+            items = []
+            for r in rec.get("items", []) or []:
+                uname = (r.get("username") or "").strip()
+                base = full_map.get(uname)
+                if base:
+                    item = dict(base)
+                else:
+                    item = {
+                        "username": uname,
+                        "nick_name": "",
+                        "remark": "",
+                        "display_name": names.get(uname, uname),
+                        "is_group": ("@chatroom" in uname),
+                    }
+                item.update({
+                    "last_access_ts": int(r.get("last_access_ts") or 0),
+                    "access_count": int(r.get("access_count") or 0),
+                    "avatar_url": f"/avatar/{urllib.parse.quote(uname, safe='')}" if uname else "",
+                })
+                items.append(item)
+
+            self._send_json(200, {"items": items, "limit": limit, "offset": offset})
 
         elif path == '/api/v1/messages':
             try:
@@ -2477,6 +2554,14 @@ class Handler(BaseHTTPRequestHandler):
             paged.sort(key=lambda x: (x[0], x[1]))
             items = [it for _, __, it in paged]
 
+            # 记录最近查询联系人（供前端“最近联系人”列表使用）
+            store = getattr(self.__class__, "persona_store", None)
+            if store:
+                try:
+                    store.record_recent_contact(username)
+                except Exception:
+                    pass
+
             payload = {
                 "username": username,
                 "display_name": display_name,
@@ -2493,6 +2578,80 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        elif path.startswith("/avatar/"):
+            username = urllib.parse.unquote(path[len("/avatar/"):]).strip()
+            if not username:
+                self.send_error(404)
+                return
+            # 安全: 防目录穿越
+            if "/" in username or "\\" in username or ".." in username:
+                self.send_error(403)
+                return
+
+            db_cache = getattr(self.__class__, "db_cache", None)
+            if not db_cache:
+                self.send_error(503, "db cache not ready")
+                return
+
+            rel = os.path.join("head_image", "head_image.db")
+            db_path = db_cache.get(rel)
+            if not db_path or not os.path.exists(db_path):
+                self.send_error(503, "head_image cache not ready")
+                return
+
+            try:
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                row = conn.execute(
+                    "SELECT md5, image_buffer, update_time FROM head_image "
+                    "WHERE username=? ORDER BY update_time DESC LIMIT 1",
+                    (username,),
+                ).fetchone()
+                conn.close()
+            except Exception as e:
+                self.send_error(500, f"query head_image failed: {e}")
+                return
+
+            if not row or not row[1]:
+                self.send_error(404)
+                return
+
+            md5_hex, buf, update_time = row
+            if isinstance(buf, memoryview):
+                buf = buf.tobytes()
+            if not isinstance(buf, (bytes, bytearray)) or len(buf) < 4:
+                self.send_error(404)
+                return
+
+            if not md5_hex:
+                md5_hex = hashlib.md5(buf).hexdigest()
+
+            etag = f"\"{md5_hex}\""
+            inm = self.headers.get("If-None-Match", "")
+            if inm and inm.strip() == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                return
+
+            ct = "application/octet-stream"
+            if buf[:3] == b"\xff\xd8\xff":
+                ct = "image/jpeg"
+            elif buf[:4] == b"\x89PNG":
+                ct = "image/png"
+            elif buf[:3] == b"GIF":
+                ct = "image/gif"
+            elif buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+                ct = "image/webp"
+
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(buf)))
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(buf)
 
         elif path.startswith('/img/'):
             filename = urllib.parse.unquote(path[5:])
@@ -2574,6 +2733,35 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/v1/recent_contacts":
+            store = getattr(self.__class__, "persona_store", None)
+            if not store:
+                self.send_error(503, "persona store not ready")
+                return
+            try:
+                payload = self._read_json_body()
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            if not isinstance(payload, dict):
+                self.send_error(400, "invalid json")
+                return
+            username = (payload.get("username") or "").strip()
+            ts = payload.get("ts")
+            try:
+                ts = int(ts) if ts is not None else None
+            except Exception:
+                ts = None
+            store.record_recent_contact(username, ts=ts)
+            self._send_json(200, {"ok": True})
+            return
+
+        self.send_error(404)
+
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -2626,6 +2814,12 @@ def main():
     Handler.contact_full = contact_full
     Handler.db_cache = db_cache
     Handler.username_db_map = username_db_map
+    try:
+        Handler.persona_store = PersonaStore(PERSONA_DB)
+        print(f"[store] persona.db: {PERSONA_DB}", flush=True)
+    except Exception as e:
+        Handler.persona_store = None
+        print(f"[store] 初始化失败: {e}", flush=True)
 
     # 后台预热所有 message DB（图片/emoji 解密必需）
     def _warmup():
