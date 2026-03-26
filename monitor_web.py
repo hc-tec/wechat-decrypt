@@ -20,6 +20,7 @@ from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_f
 from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, strip_key_metadata
 from persona_store import PersonaStore
+from chat_history import query_chat_history
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -54,6 +55,8 @@ try:
 except Exception:
     PORT = 5678
 OPEN_BROWSER = bool(_cfg.get("open_browser", True))
+API_TOKEN = str(_cfg.get("api_token") or "").strip()
+CONFIG_SELF_USERNAME = str(_cfg.get("self_username") or "").strip()
 
 sse_clients = []
 sse_lock = threading.Lock()
@@ -514,6 +517,55 @@ def load_contacts(db_cache=None, keys=None):
         return {}, []
 
     return names, full
+
+
+def detect_self_username(cfg_value: str, wechat_base_dir: str, contact_names: dict, db_cache=None, keys=None) -> str:
+    """尽力识别当前账号 username（用于判断消息方向）。
+
+    优先级：
+    1) config.json 的 self_username
+    2) wechat_base_dir 目录名（或去掉末尾 _xxxx 后缀）
+    3) message_0.db 的 Name2Id 中与目录名前缀匹配的用户名
+    """
+    cfg_value = (cfg_value or "").strip()
+    if cfg_value:
+        return cfg_value
+
+    base = os.path.basename(wechat_base_dir or "").strip()
+    candidates = []
+    if base:
+        candidates.append(base)
+        if base.startswith("wxid_") and "_" in base:
+            candidates.append(base.rsplit("_", 1)[0])
+
+    names = contact_names or {}
+    for c in candidates:
+        if c and c in names:
+            return c
+
+    users = set()
+    try:
+        rel = os.path.join("message", "message_0.db")
+        if db_cache and keys and get_key_info(keys, rel):
+            p = db_cache.get(rel)
+            if p and os.path.exists(p):
+                conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+                rows = conn.execute("SELECT user_name FROM Name2Id").fetchall()
+                conn.close()
+                users = {u for (u,) in rows if u}
+    except Exception:
+        users = set()
+
+    for c in candidates:
+        if c and c in users:
+            return c
+
+    if base and users:
+        prefix = [u for u in users if u and "@chatroom" not in u and base.startswith(u)]
+        if len(prefix) == 1:
+            return prefix[0]
+
+    return ""
 
 
 def format_msg_type(t):
@@ -2164,6 +2216,7 @@ class Handler(BaseHTTPRequestHandler):
     db_cache = None
     username_db_map = {}
     persona_store = None
+    self_username = ""
 
     def _send_json(self, status_code, payload):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2189,6 +2242,23 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except Exception:
             raise ValueError("invalid json")
+
+    def _check_write_auth(self) -> bool:
+        """可选写接口鉴权：config.json 设置 api_token 后启用。"""
+        if not API_TOKEN:
+            return True
+
+        token = ""
+        auth = self.headers.get("Authorization") or ""
+        if isinstance(auth, str) and auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+        if not token:
+            token = (self.headers.get("X-Api-Token") or "").strip()
+
+        if token != API_TOKEN:
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return False
+        return True
 
     def log_message(self, *a): pass
     def handle(self):
@@ -2238,6 +2308,8 @@ class Handler(BaseHTTPRequestHandler):
                 "time": int(time.time()),
                 "last_seq": last_seq,
                 "contacts_loaded": bool(getattr(self.__class__, "contact_full", None)),
+                "self_username": getattr(self.__class__, "self_username", "") or "",
+                "write_auth_enabled": bool(API_TOKEN),
             }
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
@@ -2460,6 +2532,40 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"username": username, **result})
                 return
 
+            # /api/v1/people/{username}/runs
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "runs":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                store = getattr(self.__class__, "persona_store", None)
+                if not store:
+                    self.send_error(503, "persona store not ready")
+                    return
+                kind = (qs.get("kind", [""])[0] or "").strip()
+                status = (qs.get("status", [""])[0] or "").strip()
+                try:
+                    limit = int((qs.get("limit", ["20"])[0] or "20").strip())
+                except Exception:
+                    limit = 20
+                try:
+                    offset = int((qs.get("offset", ["0"])[0] or "0").strip())
+                except Exception:
+                    offset = 0
+
+                try:
+                    result = store.list_runs(username=username, kind=kind, status=status, limit=limit, offset=offset)
+                    store.record_recent_contact(username)
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"runs failed: {e}")
+                    return
+
+                self._send_json(200, {"username": username, **result})
+                return
+
         elif path == '/api/v1/messages':
             try:
                 limit = int((qs.get("limit", ["200"])[0] or "200").strip())
@@ -2495,6 +2601,68 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        elif path.startswith('/api/v1/chats/') and path.endswith('/message_status'):
+            parts = path.split('/')
+            if len(parts) != 6 or parts[5] != 'message_status':
+                self.send_error(404)
+                return
+
+            username = urllib.parse.unquote(parts[4] or "")
+            if not username:
+                self.send_error(400, "missing username")
+                return
+
+            store = getattr(self.__class__, "persona_store", None)
+            if not store:
+                self.send_error(503, "persona store not ready")
+                return
+
+            app_id = (qs.get("app_id", [""])[0] or "").strip()
+            if not app_id:
+                self.send_error(400, "missing app_id")
+                return
+
+            local_id_raw = (qs.get("local_id", [""])[0] or "").strip()
+            if local_id_raw:
+                try:
+                    local_id = int(local_id_raw)
+                except Exception:
+                    self.send_error(400, "invalid local_id")
+                    return
+                item = store.get_message_status(username=username, app_id=app_id, local_id=local_id)
+                store.record_recent_contact(username)
+                self._send_json(200, {"item": item})
+                return
+
+            status = (qs.get("status", [""])[0] or "").strip()
+            try:
+                limit = int((qs.get("limit", ["50"])[0] or "50").strip())
+            except Exception:
+                limit = 50
+            try:
+                offset = int((qs.get("offset", ["0"])[0] or "0").strip())
+            except Exception:
+                offset = 0
+
+            try:
+                result = store.list_message_status(
+                    username=username,
+                    app_id=app_id,
+                    status=status,
+                    limit=limit,
+                    offset=offset,
+                )
+                store.record_recent_contact(username)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"message_status failed: {e}")
+                return
+
+            self._send_json(200, {"username": username, **result})
+            return
 
         elif path.startswith('/api/v1/chats/') and path.endswith('/history'):
             parts = path.split('/')
@@ -2535,6 +2703,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "start_ts > end_ts")
                 return
 
+            after_local_id = qs.get("after_local_id", [""])[0] or ""
+            try:
+                after_local_id = int(after_local_id) if str(after_local_id).strip() else None
+            except Exception:
+                self.send_error(400, "invalid after_local_id")
+                return
+
             include_raw = (qs.get("include_raw", ["1"])[0] or "1").strip() not in ("0", "false", "False")
 
             names = getattr(self.__class__, "contact_names", {}) or {}
@@ -2554,81 +2729,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
 
-            table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
-            if not _is_safe_msg_table_name(table_name):
-                self.send_error(400, "unsafe table name")
-                return
-
-            candidate_limit = limit + offset
-            candidate_limit = max(1, min(candidate_limit, 10000))
-
-            collected = []
-            failures = []
+            dec_paths = []
             for db_key in db_keys:
                 dec_path = db_cache.get(db_key)
-                if not dec_path:
-                    continue
-                try:
-                    conn = sqlite3.connect(f"file:{dec_path}?mode=ro", uri=True)
-                    id_map = _load_name2id_map(conn)
+                if dec_path:
+                    dec_paths.append(dec_path)
 
-                    clauses = []
-                    params = []
-                    if start_ts is not None:
-                        clauses.append("create_time >= ?")
-                        params.append(start_ts)
-                    if end_ts is not None:
-                        clauses.append("create_time <= ?")
-                        params.append(end_ts)
-                    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-
-                    rows = conn.execute(f"""
-                        SELECT local_id, local_type, create_time, real_sender_id, message_content,
-                               WCDB_CT_message_content
-                        FROM [{table_name}]
-                        {where_sql}
-                        ORDER BY create_time DESC
-                        LIMIT ?
-                    """, (*params, candidate_limit)).fetchall()
-                    conn.close()
-
-                    for local_id, local_type, create_time, real_sender_id, content, ct in rows:
-                        raw = _decompress_message_content(content, ct)
-                        if local_type and local_type > 4294967296:
-                            base_type = int(local_type % 4294967296)
-                            sub_type = int(local_type >> 32)
-                        else:
-                            base_type = int(local_type or 0)
-                            sub_type = 0
-
-                        sender_username = id_map.get(int(real_sender_id or 0), "") if is_group else ""
-                        sender_display = names.get(sender_username, sender_username) if sender_username else ""
-                        if base_type == 1:
-                            text = raw
-                        else:
-                            text = f"[{format_msg_type(base_type)}]"
-
-                        item = {
-                            "local_id": local_id,
-                            "timestamp": create_time,
-                            "local_type": local_type,
-                            "base_type": base_type,
-                            "sub_type": sub_type,
-                            "real_sender_id": real_sender_id or 0,
-                            "sender_username": sender_username,
-                            "sender_display_name": sender_display,
-                            "text": text,
-                        }
-                        if include_raw:
-                            item["raw"] = raw
-                        collected.append((int(create_time or 0), int(local_id or 0), item))
-                except Exception as e:
-                    failures.append(f"{db_key}: {e}")
-
-            collected.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            paged = collected[offset:offset + limit]
-            paged.sort(key=lambda x: (x[0], x[1]))
-            items = [it for _, __, it in paged]
+            self_username = getattr(self.__class__, "self_username", "") or ""
+            payload = query_chat_history(
+                dec_paths,
+                username=username,
+                contact_names=names,
+                self_username=self_username,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                after_local_id=after_local_id,
+                limit=limit,
+                offset=offset,
+                include_raw=include_raw,
+            )
+            # 兼容: display_name/is_group 仍按当前 handler 的名字映射
+            payload["display_name"] = display_name
+            payload["is_group"] = is_group
 
             # 记录最近查询联系人（供前端“最近联系人”列表使用）
             store = getattr(self.__class__, "persona_store", None)
@@ -2638,16 +2760,6 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            payload = {
-                "username": username,
-                "display_name": display_name,
-                "is_group": is_group,
-                "offset": offset,
-                "limit": limit,
-                "items": items,
-            }
-            if failures:
-                payload["warnings"] = failures[:5]
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2813,6 +2925,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if not self._check_write_auth():
+            return
+
         if path == "/api/v1/recent_contacts":
             store = getattr(self.__class__, "persona_store", None)
             if not store:
@@ -2834,6 +2949,44 @@ class Handler(BaseHTTPRequestHandler):
                 ts = None
             store.record_recent_contact(username, ts=ts)
             self._send_json(200, {"ok": True})
+            return
+
+        if path.startswith('/api/v1/chats/') and path.endswith('/message_status'):
+            parts = path.split('/')
+            if len(parts) != 6 or parts[5] != 'message_status':
+                self.send_error(404)
+                return
+
+            username = urllib.parse.unquote(parts[4] or "")
+            if not username:
+                self.send_error(400, "missing username")
+                return
+
+            store = getattr(self.__class__, "persona_store", None)
+            if not store:
+                self.send_error(503, "persona store not ready")
+                return
+
+            try:
+                payload = self._read_json_body()
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            if not isinstance(payload, dict):
+                self.send_error(400, "invalid json")
+                return
+
+            try:
+                item = store.upsert_message_status(username=username, payload=payload)
+                store.record_recent_contact(username)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"message_status failed: {e}")
+                return
+
+            self._send_json(200, {"ok": True, "item": item})
             return
 
         if path.startswith("/api/v1/people/") and path.endswith("/memories"):
@@ -2864,11 +3017,42 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, **res})
                 return
 
+        if path.startswith("/api/v1/people/") and path.endswith("/runs"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[0:3] == ["api", "v1", "people"] and parts[4] == "runs":
+                username = urllib.parse.unquote(parts[3] or "").strip()
+                if not username:
+                    self.send_error(400, "missing username")
+                    return
+                store = getattr(self.__class__, "persona_store", None)
+                if not store:
+                    self.send_error(503, "persona store not ready")
+                    return
+                try:
+                    payload = self._read_json_body()
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                try:
+                    res = store.create_run(username, payload if isinstance(payload, dict) else {})
+                    store.record_recent_contact(username)
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"create run failed: {e}")
+                    return
+                self._send_json(200, {"ok": True, **res})
+                return
+
         self.send_error(404)
 
     def do_PATCH(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if not self._check_write_auth():
+            return
 
         store = getattr(self.__class__, "persona_store", None)
         if not store:
@@ -2919,11 +3103,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True})
                 return
 
+        if path.startswith("/api/v1/runs/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[0:3] == ["api", "v1", "runs"]:
+                run_id = urllib.parse.unquote(parts[3] or "").strip()
+                if not run_id:
+                    self.send_error(400, "missing run_id")
+                    return
+                try:
+                    patch = self._read_json_body() or {}
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                try:
+                    store.patch_run(run_id, patch if isinstance(patch, dict) else {})
+                except ValueError as e:
+                    self.send_error(400, str(e))
+                    return
+                except Exception as e:
+                    self.send_error(500, f"patch run failed: {e}")
+                    return
+                self._send_json(200, {"ok": True})
+                return
+
         self.send_error(404)
 
     def do_DELETE(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if not self._check_write_auth():
+            return
 
         store = getattr(self.__class__, "persona_store", None)
         if not store:
@@ -2999,6 +3209,12 @@ def main():
     Handler.contact_full = contact_full
     Handler.db_cache = db_cache
     Handler.username_db_map = username_db_map
+    try:
+        Handler.self_username = detect_self_username(CONFIG_SELF_USERNAME, WECHAT_BASE_DIR, contact_names, db_cache, keys)
+        if Handler.self_username:
+            print(f"[self] username: {Handler.self_username}", flush=True)
+    except Exception:
+        Handler.self_username = CONFIG_SELF_USERNAME or ""
     try:
         Handler.persona_store = PersonaStore(PERSONA_DB)
         print(f"[store] persona.db: {PERSONA_DB}", flush=True)

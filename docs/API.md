@@ -6,6 +6,9 @@
 - 本服务只读微信本地数据库并解密/解析，**不提供 AI**。
 - 适配上层应用：自动回复、个性化对话取数、人物画像/记忆（后续可扩展写接口）。
 
+鉴权（可选）：
+- `config.json` 设置 `api_token` 后，**所有写接口**需要带 `Authorization: Bearer <token>`（或 `X-Api-Token: <token>`）。
+
 ## 基础接口
 
 ### `GET /api/v1/health`
@@ -23,7 +26,7 @@
 
 响应示例：
 ```json
-{"time":1710000000,"last_seq":123,"contacts_loaded":true}
+{"time":1710000000,"last_seq":123,"contacts_loaded":true,"self_username":"wxid_xxx","write_auth_enabled":false}
 ```
 
 ## 联系人与会话
@@ -93,9 +96,35 @@ SSE 实时推送（浏览器 EventSource 兼容）。普通消息走默认 `mess
 
 获取指定联系人/群的历史消息（从 `message_*.db` 查询）。
 
+额外参数：
+- `after_local_id`：断点续拉（仅返回 `local_id > after_local_id` 的消息）
+
 响应示例：
 ```json
 {"username":"wxid_xxx","display_name":"同事","items":[{"local_id":1,"timestamp":1710000000,"base_type":1,"text":"晚上吃啥","raw":"晚上吃啥"}]}
+```
+
+说明：
+- 返回的 `items[]` 会包含 `sender_username`/`is_send`/`direction`（可用来避免对自己消息触发自动回复）。
+- 返回 `last_local_id` 便于上层保存游标。
+
+## 消息处理状态（ACK / 幂等）
+
+### `GET /api/v1/chats/{username}/message_status?app_id=xxx&local_id=123`
+
+查询某条消息对某个上层应用的处理状态。
+
+### `GET /api/v1/chats/{username}/message_status?app_id=xxx&status=&limit=50&offset=0`
+
+列出该联系人下的处理状态记录（按 `updated_at` 倒序）。
+
+### `POST /api/v1/chats/{username}/message_status`
+
+写入/更新一条处理状态（Upsert）。
+
+请求示例：
+```json
+{"app_id":"auto-reply","local_id":123,"status":"replied","info":{"reply_id":"..."}}
 ```
 
 ## 人物画像与记忆（不含 AI，仅存取）
@@ -125,3 +154,22 @@ SSE 实时推送（浏览器 EventSource 兼容）。普通消息走默认 `mess
 ### `DELETE /api/v1/memories/{id}`
 
 软删除：将条目标记为 `invalidated`。
+
+## AI 运行记录（仅元数据存储，不执行 AI）
+
+### `GET /api/v1/people/{username}/runs?kind=&status=&limit=20&offset=0`
+
+列出画像/记忆/总结等 AI 运行记录（由上层应用写入）。
+
+### `POST /api/v1/people/{username}/runs`
+
+创建一条运行记录。
+
+请求示例：
+```json
+{"app_id":"persona-ui","kind":"profile_refresh","status":"running","model":"gpt-4.1-mini","input_range":{"start_ts":1710000000,"end_ts":1710003600}}
+```
+
+### `PATCH /api/v1/runs/{run_id}`
+
+更新运行记录（例如结束时写入 `status/finished_at/error/tokens`）。

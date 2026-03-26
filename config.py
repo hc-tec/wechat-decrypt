@@ -16,7 +16,8 @@ def _get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-CONFIG_FILE = os.path.join(_get_app_dir(), "config.json")
+CONFIG_FILE = os.environ.get("WECHAT_DECRYPT_CONFIG") or os.path.join(_get_app_dir(), "config.json")
+CONFIG_FILE = os.path.abspath(os.path.expanduser(CONFIG_FILE))
 
 _SYSTEM = platform.system().lower()
 
@@ -39,10 +40,14 @@ _DEFAULT = {
     "decoded_voice_dir": "decoded_voices",
     "persona_db": "persona.db",
     "wechat_process": _DEFAULT_PROCESS,
+    # 当前账号 username（可选；用于判断消息方向 is_send/in-out）
+    "self_username": "",
     # 本地服务配置（默认只监听本机，避免隐私泄露到局域网）
     "listen_host": "127.0.0.1",
     "listen_port": 5678,
     "open_browser": True,
+    # 可选：API 写入鉴权（Bearer Token）。为空则不启用。
+    "api_token": "",
 }
 
 

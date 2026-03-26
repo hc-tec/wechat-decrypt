@@ -112,6 +112,7 @@ Linux 版 `config.json` 示例：
 本项目在 Web UI 同一端口提供 HTTP API，用于上层应用（自动回复、个性化取数、画像等）读取联系人/会话/消息：
 
 - API 文档：`docs/API.md`
+- 集成缺口清单（上层应用设计参考）：`docs/INTEGRATION_GAPS.md`
 - Windows 分发建议：`docs/DISTRIBUTION_WINDOWS.md`
 
 ### MCP Server (Claude AI 集成)
