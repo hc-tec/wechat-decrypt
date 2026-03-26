@@ -114,6 +114,18 @@ class MainWindow(QtWidgets.QMainWindow):
         header.addWidget(self._status)
         layout.addLayout(header)
 
+        # Autostart (top priority for non-technical users)
+        autostart_group = QtWidgets.QGroupBox("开机自启")
+        autostart_l = QtWidgets.QHBoxLayout(autostart_group)
+        autostart_l.setContentsMargins(12, 10, 12, 10)
+        autostart_l.setSpacing(10)
+
+        self._chk_autostart = QtWidgets.QCheckBox("开机自启（登录后自动后台运行）")
+        self._chk_autostart.toggled.connect(self.on_toggle_autostart)
+        autostart_l.addWidget(self._chk_autostart)
+        autostart_l.addStretch(1)
+        layout.addWidget(autostart_group)
+
         # Service controls
         svc_group = QtWidgets.QGroupBox("服务")
         svc_l = QtWidgets.QGridLayout(svc_group)
@@ -155,9 +167,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Config
         cfg_group = QtWidgets.QGroupBox("配置")
-        cfg_l = QtWidgets.QGridLayout(cfg_group)
-        cfg_l.setHorizontalSpacing(10)
-        cfg_l.setVerticalSpacing(8)
+        cfg_root = QtWidgets.QVBoxLayout(cfg_group)
+        cfg_root.setSpacing(10)
 
         self._cfg_file = QtWidgets.QLineEdit(self._config_path)
         self._cfg_file.setReadOnly(True)
@@ -181,43 +192,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self._btn_save = QtWidgets.QPushButton("保存配置")
         self._btn_save.clicked.connect(self.save_config)
 
-        self._chk_autostart = QtWidgets.QCheckBox("开机自启（登录后后台运行）")
-        self._chk_autostart.toggled.connect(self.on_toggle_autostart)
-
         self._btn_admin = QtWidgets.QPushButton("以管理员身份重启")
         self._btn_admin.clicked.connect(self.restart_as_admin)
 
+        # Basic (always visible)
+        basic = QtWidgets.QWidget()
+        basic_l = QtWidgets.QGridLayout(basic)
+        basic_l.setHorizontalSpacing(10)
+        basic_l.setVerticalSpacing(8)
+
         row = 0
-        cfg_l.addWidget(QtWidgets.QLabel("config.json"), row, 0)
-        cfg_l.addWidget(self._cfg_file, row, 1, 1, 2)
-        cfg_l.addWidget(self._btn_open_cfg, row, 3)
+        basic_l.addWidget(QtWidgets.QLabel("db_dir"), row, 0)
+        basic_l.addWidget(self._db_dir, row, 1, 1, 2)
+        basic_l.addWidget(self._btn_pick_db, row, 3)
 
         row += 1
-        cfg_l.addWidget(QtWidgets.QLabel("db_dir"), row, 0)
-        cfg_l.addWidget(self._db_dir, row, 1, 1, 2)
-        cfg_l.addWidget(self._btn_pick_db, row, 3)
+        basic_l.addWidget(self._open_browser, row, 1)
+        basic_l.addWidget(self._btn_save, row, 2)
+        basic_l.addWidget(self._btn_admin, row, 3)
+
+        cfg_root.addWidget(basic)
+
+        # Advanced (collapsed by default)
+        self._advanced_group = QtWidgets.QGroupBox("高级设置（点开后可见）")
+        self._advanced_group.setCheckable(True)
+        self._advanced_group.setChecked(False)
+
+        self._advanced_content = QtWidgets.QWidget()
+        adv_l = QtWidgets.QGridLayout(self._advanced_content)
+        adv_l.setHorizontalSpacing(10)
+        adv_l.setVerticalSpacing(8)
+
+        row = 0
+        adv_l.addWidget(QtWidgets.QLabel("config.json"), row, 0)
+        adv_l.addWidget(self._cfg_file, row, 1, 1, 2)
+        adv_l.addWidget(self._btn_open_cfg, row, 3)
 
         row += 1
-        cfg_l.addWidget(QtWidgets.QLabel("listen_host"), row, 0)
-        cfg_l.addWidget(self._listen_host, row, 1)
-        cfg_l.addWidget(QtWidgets.QLabel("listen_port"), row, 2)
-        cfg_l.addWidget(self._listen_port, row, 3)
+        adv_l.addWidget(QtWidgets.QLabel("listen_host"), row, 0)
+        adv_l.addWidget(self._listen_host, row, 1)
+        adv_l.addWidget(QtWidgets.QLabel("listen_port"), row, 2)
+        adv_l.addWidget(self._listen_port, row, 3)
 
         row += 1
-        cfg_l.addWidget(self._open_browser, row, 1, 1, 2)
-        cfg_l.addWidget(self._btn_save, row, 3)
+        adv_l.addWidget(QtWidgets.QLabel("api_token（可选）"), row, 0)
+        adv_l.addWidget(self._api_token, row, 1, 1, 3)
 
         row += 1
-        cfg_l.addWidget(QtWidgets.QLabel("api_token（可选）"), row, 0)
-        cfg_l.addWidget(self._api_token, row, 1, 1, 3)
+        adv_l.addWidget(QtWidgets.QLabel("self_username（可选）"), row, 0)
+        adv_l.addWidget(self._self_username, row, 1, 1, 3)
 
-        row += 1
-        cfg_l.addWidget(QtWidgets.QLabel("self_username（可选）"), row, 0)
-        cfg_l.addWidget(self._self_username, row, 1, 1, 3)
+        adv_root = QtWidgets.QVBoxLayout(self._advanced_group)
+        adv_root.setContentsMargins(12, 10, 12, 10)
+        adv_root.addWidget(self._advanced_content)
+        self._advanced_content.setVisible(False)
+        self._advanced_group.toggled.connect(self._advanced_content.setVisible)
 
-        row += 1
-        cfg_l.addWidget(self._chk_autostart, row, 1, 1, 2)
-        cfg_l.addWidget(self._btn_admin, row, 3)
+        cfg_root.addWidget(self._advanced_group)
 
         layout.addWidget(cfg_group)
 
