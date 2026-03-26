@@ -84,7 +84,6 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         self.setWindowTitle(f"{APP_TITLE} ({QT_LIB})")
-        self.resize(980, 680)
 
         self._really_quit = False
         self._auto_start_service = bool(auto_start_service)
@@ -107,6 +106,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._apply_theme()
+        self._apply_initial_window_geometry()
         self._refresh_ui_from_config()
         self._refresh_autostart_ui()
 
@@ -115,6 +115,49 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(300, self._hide_to_tray)
 
     # ---------------- UI ----------------
+
+    def _get_available_screen_geometry(self):
+        try:
+            screen = QtWidgets.QApplication.primaryScreen()
+            return screen.availableGeometry() if screen else None
+        except Exception:
+            return None
+
+    def _apply_initial_window_geometry(self):
+        # 避免固定尺寸在高 DPI 缩放下“变成超大窗口”，导致内容超出屏幕。
+        g = self._get_available_screen_geometry()
+        if not g:
+            self.resize(980, 680)
+            return
+
+        margin = 40
+        max_w = max(480, int(g.width() - margin))
+        max_h = max(360, int(g.height() - margin))
+
+        target_w = min(980, int(g.width() * 0.92))
+        target_h = min(680, int(g.height() * 0.85))
+
+        target_w = max(720, min(target_w, max_w))
+        target_h = max(520, min(target_h, max_h))
+
+        self.resize(target_w, target_h)
+        try:
+            self.move(
+                int(g.x() + (g.width() - target_w) / 2),
+                int(g.y() + (g.height() - target_h) / 2),
+            )
+        except Exception:
+            pass
+
+        try:
+            avail_h = int(g.height())
+            guide_min = max(90, int(avail_h * 0.14))
+            guide_max = max(guide_min, int(avail_h * 0.20))
+            guide_max = min(200, guide_max)
+            self._guide.setMinimumHeight(guide_min)
+            self._guide.setMaximumHeight(guide_max)
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = QtWidgets.QWidget(self)
@@ -154,10 +197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._guide = QtWidgets.QTextBrowser()
         self._guide.setOpenExternalLinks(True)
         self._guide.setReadOnly(True)
-        # 该区域用于给非技术用户“可见且稳定”的引导高度；否则初次布局时可能被挤压到几乎看不见，
-        # 直到触发一次布局重算（例如展开/收起高级设置）才恢复正常。
-        self._guide.setMinimumHeight(170)
-        self._guide.setMaximumHeight(220)
+        # 该区域需要“初次可见”；具体高度会在 `_apply_initial_window_geometry()` 里按屏幕大小自适应。
         try:
             self._guide.setSizeAdjustPolicy(
                 QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
