@@ -24,6 +24,7 @@ __pycache__/
 .venv*/
 build/
 dist/
+dist-installer/
 *.spec
 
 # OS

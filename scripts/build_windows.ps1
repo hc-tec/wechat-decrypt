@@ -16,5 +16,12 @@ if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller failed with exit code $LASTEXITCODE"
 }
 
+# GUI（Qt）：用于普通用户配置/启动/托盘常驻
+& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--noconsole" "--name" "WeChatDataServiceGUI" "gui_main.py"
+if ($LASTEXITCODE -ne 0) {
+  throw "PyInstaller GUI failed with exit code $LASTEXITCODE"
+}
+
 Write-Host ""
 Write-Host "Built: dist\\WeChatDataService\\WeChatDataService.exe"
+Write-Host "Built: dist\\WeChatDataServiceGUI\\WeChatDataServiceGUI.exe"

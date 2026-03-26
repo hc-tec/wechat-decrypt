@@ -3,3 +3,5 @@ zstandard>=0.22,<1
 mcp>=1.0,<2
 # Optional: decode WeChat voice (SILK → WAV)
 pilk>=0.2,<1; platform_system=="Windows"
+# GUI: Qt launcher (PyQt). 注意：PyQt 为 GPL/商业许可，产品分发前请确认合规。
+PyQt6>=6.6,<7; platform_system=="Windows"

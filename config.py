@@ -12,7 +12,17 @@ import sys
 def _get_app_dir():
     """返回可写的应用目录（优先 exe 所在目录，便于 PyInstaller 分发）。"""
     if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        try:
+            test_path = os.path.join(exe_dir, ".__writable_test__")
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write("1")
+            os.unlink(test_path)
+            return exe_dir
+        except OSError:
+            # 安装到 Program Files 等只读目录时，回退到用户目录
+            appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+            return os.path.join(appdata, "WeChatDataService")
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -200,11 +210,13 @@ def load_config():
         if detected:
             print(f"[+] 自动检测到微信数据目录: {detected}")
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
+            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
             print(f"[+] 已保存到: {CONFIG_FILE}")
         else:
             if not os.path.exists(CONFIG_FILE):
+                os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
                 with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                     json.dump(_DEFAULT, f, indent=4, ensure_ascii=False)
             print(f"[!] 未能自动检测微信数据目录")
@@ -239,4 +251,78 @@ def load_config():
     if "decoded_voice_dir" not in cfg:
         cfg["decoded_voice_dir"] = os.path.join(base, "decoded_voices")
 
+    return cfg
+
+
+def get_config_path() -> str:
+    return CONFIG_FILE
+
+
+def read_config_file(path: str | None = None) -> dict:
+    path = os.path.abspath(os.path.expanduser(path or CONFIG_FILE))
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_config_file(cfg: dict, path: str | None = None) -> None:
+    if not isinstance(cfg, dict):
+        raise ValueError("cfg 必须是 dict")
+    path = os.path.abspath(os.path.expanduser(path or CONFIG_FILE))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+
+
+def load_config_soft(path: str | None = None) -> dict:
+    """GUI/安装器场景用：尽量加载配置，但不 sys.exit。
+
+    返回值额外包含：
+    - `_config_file`: 当前使用的配置文件路径
+    - `_setup_required`: 是否需要用户补全 `db_dir`
+    """
+    path = os.path.abspath(os.path.expanduser(path or CONFIG_FILE))
+    cfg = read_config_file(path)
+
+    db_dir = cfg.get("db_dir", "")
+    setup_required = False
+
+    if not db_dir or db_dir == _DEFAULT_TEMPLATE_DIR or "your_wxid" in str(db_dir):
+        detected = auto_detect_db_dir()
+        if detected:
+            cfg = {**_DEFAULT, **cfg, "db_dir": detected}
+            try:
+                write_config_file(cfg, path)
+            except Exception:
+                pass
+        else:
+            setup_required = True
+            cfg = {**_DEFAULT, **cfg}
+            # 确保文件存在，方便 GUI 直接编辑
+            if not os.path.exists(path):
+                try:
+                    write_config_file(cfg, path)
+                except Exception:
+                    pass
+    else:
+        cfg = {**_DEFAULT, **cfg}
+
+    base = os.path.dirname(os.path.abspath(path))
+    for key in ("keys_file", "decrypted_dir", "decoded_image_dir", "decoded_voice_dir", "persona_db"):
+        if key in cfg and not os.path.isabs(cfg[key]):
+            cfg[key] = os.path.join(base, cfg[key])
+
+    db_dir = cfg.get("db_dir", "")
+    if db_dir and os.path.basename(db_dir) == "db_storage":
+        cfg["wechat_base_dir"] = os.path.dirname(db_dir)
+    else:
+        cfg["wechat_base_dir"] = db_dir
+
+    cfg["_config_file"] = path
+    cfg["_setup_required"] = bool(setup_required)
     return cfg

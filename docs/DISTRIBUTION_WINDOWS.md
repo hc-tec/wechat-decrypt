@@ -4,10 +4,14 @@
 
 ## 推荐分发形态
 
-- **onedir 文件夹包**（推荐）：`WeChatDataService/WeChatDataService.exe` + 同目录 `config.json` / `all_keys.json`
+- **onedir 文件夹包**（推荐）：
+  - `WeChatDataService/WeChatDataService.exe`（服务进程）
+  - `WeChatDataServiceGUI/WeChatDataServiceGUI.exe`（GUI 启动器，普通用户推荐用它）
 - 进一步封装：用 Inno Setup / NSIS 做 `Setup.exe`，安装到用户目录并创建桌面快捷方式
 
-说明：本项目的 `config.json` / `all_keys.json` 默认放在“程序可执行文件所在目录”，便于打包分发和持久化。
+说明：
+- 可执行文件所在目录可写时：`config.json` / `all_keys.json` 默认放在 exe 同目录（便于“解压即用”）。
+- 安装到 `Program Files` 等只读目录时：会自动改为用户目录：`%APPDATA%\\WeChatDataService\\`。
 
 ## 用户使用流程（建议写到你的产品说明里）
 
@@ -27,4 +31,3 @@
 对普通用户友好做法：
 - 安装器里创建「开机启动」选项：用 Windows 任务计划程序（Task Scheduler）在登录后启动 `WeChatDataService.exe`
 - 或者把快捷方式放到启动文件夹：`shell:startup`
-
