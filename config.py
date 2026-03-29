@@ -55,7 +55,8 @@ _DEFAULT = {
     # 本地服务配置（默认只监听本机，避免隐私泄露到局域网）
     "listen_host": "127.0.0.1",
     "listen_port": 5678,
-    "open_browser": True,
+    # 是否启动后自动打开 Web UI（普通用户常常不需要，默认关闭）
+    "open_browser": False,
     # 可选：API 写入鉴权（Bearer Token）。为空则不启用。
     "api_token": "",
 }

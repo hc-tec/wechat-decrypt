@@ -3,6 +3,7 @@ import sys
 import json
 import urllib.request
 import re
+from collections import deque
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
@@ -76,6 +77,38 @@ def _get_json(url: str, *, timeout: float = 1.5) -> dict | None:
         return None
 
 
+_Signal = getattr(QtCore, "pyqtSignal", None)
+if _Signal is None:
+    _Signal = getattr(QtCore, "Signal", None)
+
+
+class _HealthEmitter(QtCore.QObject):
+    done = _Signal(bool, object) if _Signal else None  # type: ignore[misc]
+
+
+class _HealthWorker(QtCore.QRunnable):
+    def __init__(self, emitter: _HealthEmitter, base_url: str):
+        super().__init__()
+        self._emitter = emitter
+        self._base_url = base_url
+
+    def run(self):
+        ok = False
+        state = None
+        try:
+            ok = _can_open_url(self._base_url + "/api/v1/health")
+            if ok:
+                state = _get_json(self._base_url + "/api/v1/state", timeout=1.0)
+        except Exception:
+            ok = False
+            state = None
+        try:
+            if getattr(self._emitter, "done", None):
+                self._emitter.done.emit(bool(ok), state)
+        except Exception:
+            pass
+
+
 def _suggest_self_username_from_db_dir(db_dir: str) -> str:
     db_dir = (db_dir or "").strip()
     if not db_dir:
@@ -122,6 +155,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._state_self_username = ""
 
+        self._health_pending = False
+        self._health_emitter = _HealthEmitter()
+        try:
+            self._health_emitter.done.connect(self._on_health_done)  # type: ignore[union-attr]
+        except Exception:
+            pass
+
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(1500)
         self._poll_timer.timeout.connect(self._poll_health)
@@ -131,6 +171,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_initial_window_geometry()
         self._refresh_ui_from_config()
         self._refresh_autostart_ui()
+
+        # Service stdout is very chatty; buffer+throttle UI updates to keep GUI responsive.
+        self._svc_out_queue = deque()
+        self._svc_out_chars = 0
+        self._svc_out_drops = 0
+        self._svc_out_timer = QtCore.QTimer(self)
+        self._svc_out_timer.setInterval(80)
+        self._svc_out_timer.timeout.connect(self._flush_service_output)
+        self._svc_out_timer.start()
 
         if self._auto_start_service:
             QtCore.QTimer.singleShot(200, self.start_service)
@@ -351,7 +400,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._listen_port = QtWidgets.QSpinBox()
         self._listen_port.setRange(1, 65535)
 
-        self._open_browser = QtWidgets.QCheckBox("启动后自动打开浏览器")
+        self._open_browser = QtWidgets.QCheckBox("服务启动后自动打开 Web UI（可选）")
 
         self._self_username_detected = QtWidgets.QLineEdit()
         self._self_username_detected.setReadOnly(True)
@@ -401,7 +450,6 @@ class MainWindow(QtWidgets.QMainWindow):
         basic_l.addWidget(self._self_hint, row, 1, 1, 3)
 
         row += 1
-        basic_l.addWidget(self._open_browser, row, 1)
         basic_l.addWidget(self._btn_save, row, 2)
         basic_l.addWidget(self._btn_admin, row, 3)
 
@@ -427,6 +475,10 @@ class MainWindow(QtWidgets.QMainWindow):
         adv_l.addWidget(self._listen_host, row, 1)
         adv_l.addWidget(QtWidgets.QLabel("listen_port"), row, 2)
         adv_l.addWidget(self._listen_port, row, 3)
+
+        row += 1
+        adv_l.addWidget(QtWidgets.QLabel("open_browser"), row, 0)
+        adv_l.addWidget(self._open_browser, row, 1, 1, 3)
 
         row += 1
         adv_l.addWidget(QtWidgets.QLabel("api_token（可选）"), row, 0)
@@ -466,6 +518,11 @@ class MainWindow(QtWidgets.QMainWindow):
         log_l.addLayout(log_top)
         self._log = QtWidgets.QPlainTextEdit()
         self._log.setReadOnly(True)
+        self._log.setUndoRedoEnabled(False)
+        try:
+            self._log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        except Exception:
+            pass
         self._log.setMaximumBlockCount(2000)
         log_l.addWidget(self._log)
 
@@ -711,6 +768,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._state_self_username = ""
         self._self_username_detected.setText("")
+        self._auto_open_web_pending = False
+        self._auto_open_web_done = False
 
         self.save_config()
         cfg = load_config_soft(self._config_path)
@@ -722,7 +781,14 @@ class MainWindow(QtWidgets.QMainWindow):
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
+        # 服务端不应主动弹浏览器；GUI 按需控制
+        env.insert("WECHAT_DECRYPT_NO_BROWSER", "1")
         self._proc.setProcessEnvironment(env)
+
+        try:
+            self._auto_open_web_pending = bool(cfg.get("open_browser", False)) and (not self._auto_start_service)
+        except Exception:
+            self._auto_open_web_pending = False
 
         if _is_frozen():
             service_exe = _find_service_exe()
@@ -869,10 +935,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_proc_output(self):
         data = bytes(self._proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        if not data:
-            return
-        for line in data.splitlines():
-            self._append_log(line, tag="service")
+        if data:
+            self._enqueue_service_output(data)
 
     def _on_proc_state_changed(self, _state):
         st = self._proc.state()
@@ -893,19 +957,97 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"[gui] exited: code={exit_code} status={exit_status}")
 
     def _poll_health(self):
+        if self._proc.state() != QtCore.QProcess.ProcessState.Running:
+            return
+        if self._health_pending:
+            return
         base = self._url.text().strip().rstrip("/")
-        ok = _can_open_url(base + "/api/v1/health")
-        if ok and self._proc.state() == QtCore.QProcess.ProcessState.Running:
+        if not base:
+            return
+        self._health_pending = True
+        try:
+            QtCore.QThreadPool.globalInstance().start(_HealthWorker(self._health_emitter, base))
+        except Exception:
+            self._health_pending = False
+
+    def _on_health_done(self, ok: bool, state):
+        self._health_pending = False
+        if self._proc.state() != QtCore.QProcess.ProcessState.Running:
+            return
+        if ok:
             self._update_status("● 运行中（可达）", ok=True)
-            state = _get_json(base + "/api/v1/state", timeout=1.0)
+            if self._auto_open_web_pending and (not getattr(self, "_auto_open_web_done", False)):
+                self._auto_open_web_done = True
+                try:
+                    self.open_web_ui()
+                except Exception:
+                    pass
             if isinstance(state, dict):
                 new_self = (state.get("self_username") or "").strip()
                 if new_self != (self._state_self_username or ""):
                     self._state_self_username = new_self
                     self._self_username_detected.setText(new_self or "")
                     self._refresh_ui_from_config()
-        elif self._proc.state() == QtCore.QProcess.ProcessState.Running:
+        else:
             self._update_status("● 运行中（不可达）", ok=False)
+
+    def _enqueue_service_output(self, text: str):
+        if not text:
+            return
+
+        # Normalize newlines for consistent rendering in QPlainTextEdit.
+        text = text.replace("\r\n", "\n")
+
+        max_chars = 200_000
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+            self._svc_out_queue.clear()
+            self._svc_out_chars = 0
+            self._svc_out_drops += 1
+
+        incoming = len(text)
+        while self._svc_out_queue and (self._svc_out_chars + incoming) > max_chars:
+            old = self._svc_out_queue.popleft()
+            self._svc_out_chars -= len(old)
+            self._svc_out_drops += 1
+
+        self._svc_out_queue.append(text)
+        self._svc_out_chars += incoming
+
+    def _flush_service_output(self):
+        if not getattr(self, "_svc_out_queue", None):
+            return
+        if not self._svc_out_queue:
+            return
+
+        flush_limit = 12_000
+        parts = []
+        chars = 0
+        while self._svc_out_queue and chars < flush_limit:
+            p = self._svc_out_queue.popleft()
+            self._svc_out_chars -= len(p)
+            parts.append(p)
+            chars += len(p)
+        out = "".join(parts)
+        if self._svc_out_drops:
+            out = (
+                f"[gui] 服务输出过多，已丢弃 {self._svc_out_drops} 段（完整日志请看 service.log）\n"
+                + out
+            )
+            self._svc_out_drops = 0
+
+        try:
+            self._log.setUpdatesEnabled(False)
+            cur = self._log.textCursor()
+            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cur.insertText(out)
+            self._log.setTextCursor(cur)
+            self._log.ensureCursorVisible()
+        finally:
+            try:
+                self._log.setUpdatesEnabled(True)
+            except Exception:
+                pass
 
     # ---------------- helpers ----------------
 

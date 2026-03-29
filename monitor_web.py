@@ -54,9 +54,16 @@ try:
     PORT = int(_cfg.get("listen_port", 5678) or 5678)
 except Exception:
     PORT = 5678
-OPEN_BROWSER = bool(_cfg.get("open_browser", True))
+OPEN_BROWSER = bool(_cfg.get("open_browser", False))
 API_TOKEN = str(_cfg.get("api_token") or "").strip()
 CONFIG_SELF_USERNAME = str(_cfg.get("self_username") or "").strip()
+
+# GUI/服务化场景：不要自动弹浏览器（由 GUI 的“打开 Web UI”按钮来控制）
+try:
+    if str(os.environ.get("WECHAT_DECRYPT_NO_BROWSER") or "").strip().lower() in ("1", "true", "yes", "on"):
+        OPEN_BROWSER = False
+except Exception:
+    pass
 
 sse_clients = []
 sse_lock = threading.Lock()
