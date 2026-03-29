@@ -71,6 +71,15 @@ def ensure_keys(keys_file, db_dir):
 
 
 def main():
+    try:
+        from config import get_config_path
+        from log_utils import init_app_logging
+
+        _, log_path = init_app_logging("service", config_path=get_config_path())
+        print(f"[log] {log_path}")
+    except Exception:
+        pass
+
     print("=" * 60)
     print("  WeChat Decrypt")
     print("=" * 60)

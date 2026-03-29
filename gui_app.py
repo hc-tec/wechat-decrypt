@@ -1,10 +1,12 @@
 import os
 import sys
+import json
 import urllib.request
 import re
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
+from log_utils import get_current_log_dir, get_current_log_path, init_app_logging, write_log_line
 from qt_compat import QT_LIB, QtCore, QtGui, QtWidgets
 
 
@@ -43,6 +45,8 @@ def _find_service_exe() -> str:
         os.path.join(gui_dir, "Service", "WeChatDataService.exe"),
         os.path.join(parent, "WeChatDataService.exe"),
         os.path.join(parent, "Service", "WeChatDataService.exe"),
+        # 开发构建输出（PyInstaller onedir）：dist\\WeChatDataServiceGUI + dist\\WeChatDataService
+        os.path.join(parent, "WeChatDataService", "WeChatDataService.exe"),
     ]
     for p in candidates:
         if os.path.isfile(p):
@@ -57,6 +61,19 @@ def _can_open_url(url: str) -> bool:
             return resp.status == 200
     except Exception:
         return False
+
+
+def _get_json(url: str, *, timeout: float = 1.5) -> dict | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "WeChatDataServiceGUI"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            body = resp.read()
+        obj = json.loads(body.decode("utf-8", errors="replace"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
 def _suggest_self_username_from_db_dir(db_dir: str) -> str:
@@ -89,6 +106,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._auto_start_service = bool(auto_start_service)
 
         self._config_path = get_config_path()
+        init_app_logging("gui", config_path=self._config_path)
+        self._log_dir = get_current_log_dir()
+        self._log_path = get_current_log_path()
         self._cfg = load_config_soft(self._config_path)
 
         self._proc = QtCore.QProcess(self)
@@ -99,6 +119,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._tray = None
         self._setup_tray()
+
+        self._state_self_username = ""
 
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.setInterval(1500)
@@ -116,9 +138,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- UI ----------------
 
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self._ensure_within_screen)
+
+    def _ensure_within_screen(self):
+        g = self._get_available_screen_geometry()
+        if not g:
+            return
+
+        margin = 24
+        max_w = max(320, int(g.width() - margin))
+        max_h = max(240, int(g.height() - margin))
+
+        w = min(int(self.width()), max_w)
+        h = min(int(self.height()), max_h)
+        if w != self.width() or h != self.height():
+            self.resize(w, h)
+
+        try:
+            x = int(self.x())
+            y = int(self.y())
+            x = max(int(g.x()), min(x, int(g.x() + g.width() - w)))
+            y = max(int(g.y()), min(y, int(g.y() + g.height() - h)))
+            self.move(x, y)
+        except Exception:
+            pass
+
     def _get_available_screen_geometry(self):
         try:
-            screen = QtWidgets.QApplication.primaryScreen()
+            screen = None
+            try:
+                screen = self.screen()
+            except Exception:
+                screen = None
+            if not screen:
+                try:
+                    screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+                except Exception:
+                    screen = None
+            if not screen:
+                screen = QtWidgets.QApplication.primaryScreen()
             return screen.availableGeometry() if screen else None
         except Exception:
             return None
@@ -135,12 +195,12 @@ class MainWindow(QtWidgets.QMainWindow):
         max_w = max(420, int(g.width() - margin))
         max_h = max(320, int(g.height() - margin))
 
-        # 初始窗口尽量“不会遮住屏幕”，同时在大屏上也不要太夸张。
+        # 初始窗口尽量“不会遮住屏幕”，同时在大屏上保持紧凑。
         target_w = min(980, int(max_w * 0.98))
-        target_h = min(620, int(max_h * 0.78))
+        target_h = min(560, int(max_h * 0.70))
 
         min_w = min(760, max_w)
-        min_h = min(460, max_h)
+        min_h = min(420, max_h)
 
         target_w = min(max_w, max(min_w, target_w))
         target_h = min(max_h, max(min_h, target_h))
@@ -293,10 +353,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._open_browser = QtWidgets.QCheckBox("启动后自动打开浏览器")
 
-        self._self_username = QtWidgets.QLineEdit()
-        self._btn_guess_self = QtWidgets.QPushButton("自动填充")
+        self._self_username_detected = QtWidgets.QLineEdit()
+        self._self_username_detected.setReadOnly(True)
+        self._self_username_detected.setPlaceholderText("启动服务后自动识别")
+
+        self._self_username_override = QtWidgets.QLineEdit()
+        self._btn_guess_self = QtWidgets.QPushButton("从 db_dir 推导")
         self._btn_guess_self.clicked.connect(self.guess_self_username)
-        self._self_hint = QtWidgets.QLabel("用于判断哪些消息是“我发的”，避免自动回复自己。")
+        self._self_hint = QtWidgets.QLabel(
+            "无需知道 wxid：服务会自动识别当前账号（用于判断“我发的消息”，避免自动回复自己）。识别不准时再手动覆盖。"
+        )
         self._self_hint.setObjectName("hint")
         self._self_hint.setWordWrap(True)
 
@@ -323,8 +389,12 @@ class MainWindow(QtWidgets.QMainWindow):
         basic_l.addWidget(self._btn_pick_db, row, 3)
 
         row += 1
-        basic_l.addWidget(QtWidgets.QLabel("self_username"), row, 0)
-        basic_l.addWidget(self._self_username, row, 1, 1, 2)
+        basic_l.addWidget(QtWidgets.QLabel("当前账号（自动识别）"), row, 0)
+        basic_l.addWidget(self._self_username_detected, row, 1, 1, 3)
+
+        row += 1
+        basic_l.addWidget(QtWidgets.QLabel("手动覆盖（可选）"), row, 0)
+        basic_l.addWidget(self._self_username_override, row, 1, 1, 2)
         basic_l.addWidget(self._btn_guess_self, row, 3)
 
         row += 1
@@ -385,6 +455,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Logs
         log_group = QtWidgets.QGroupBox("日志")
         log_l = QtWidgets.QVBoxLayout(log_group)
+        log_top = QtWidgets.QHBoxLayout()
+        self._log_path_view = QtWidgets.QLineEdit()
+        self._log_path_view.setReadOnly(True)
+        self._log_path_view.setText(self._log_path or "")
+        self._btn_open_logs = QtWidgets.QPushButton("打开日志文件夹")
+        self._btn_open_logs.clicked.connect(self.open_log_folder)
+        log_top.addWidget(self._log_path_view, 1)
+        log_top.addWidget(self._btn_open_logs)
+        log_l.addLayout(log_top)
         self._log = QtWidgets.QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(2000)
@@ -454,7 +533,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._listen_port.setValue(5678)
         self._open_browser.setChecked(bool(cfg.get("open_browser", True)))
         self._api_token.setText(cfg.get("api_token", "") or "")
-        self._self_username.setText(cfg.get("self_username", "") or "")
+        self._self_username_override.setText(cfg.get("self_username", "") or "")
 
         self._image_aes_key.setText(cfg.get("image_aes_key", "") or "")
         xor_val = cfg.get("image_xor_key", "")
@@ -465,9 +544,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         suggested_self = _suggest_self_username_from_db_dir(cfg.get("db_dir", "") or "")
         if suggested_self:
-            self._self_username.setPlaceholderText(suggested_self)
+            self._self_username_override.setPlaceholderText(f"留空=自动识别（例如：{suggested_self}）")
         else:
-            self._self_username.setPlaceholderText("例如：wxid_xxx")
+            self._self_username_override.setPlaceholderText("留空=自动识别（例如：wxid_xxx）")
+
+        detected = (self._state_self_username or "").strip()
+        if detected:
+            self._self_username_detected.setText(detected)
+        else:
+            self._self_username_detected.setText("")
+            if suggested_self:
+                self._self_username_detected.setPlaceholderText(f"可能是：{suggested_self}（来自 db_dir）")
+            else:
+                self._self_username_detected.setPlaceholderText("启动服务后自动识别")
 
         host = (cfg.get("listen_host") or "127.0.0.1").strip() or "127.0.0.1"
         port = int(cfg.get("listen_port") or 5678)
@@ -485,10 +574,16 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._cfg or {}
         db_dir = (cfg.get("db_dir") or "").strip()
         suggested_self = _suggest_self_username_from_db_dir(db_dir)
-        self_u = (cfg.get("self_username") or "").strip()
+        override_u = (cfg.get("self_username") or "").strip()
+        detected_u = (self._state_self_username or "").strip()
         image_aes = (cfg.get("image_aes_key") or "").strip()
 
-        status_self = "已填写" if self_u else ("未填写（建议填写）" if suggested_self else "未填写")
+        if detected_u:
+            status_self = f"已识别：<code>{detected_u}</code>"
+        elif override_u:
+            status_self = f"已设置覆盖：<code>{override_u}</code>（启动后生效）"
+        else:
+            status_self = "未识别（启动服务后自动识别）"
         status_img = "已配置" if image_aes else "未配置（微信 4.0 / 2025-08+ 可能需要）"
 
         html = f"""
@@ -497,20 +592,25 @@ class MainWindow(QtWidgets.QMainWindow):
           <ol style="margin-top:6px;margin-bottom:10px;">
             <li>先启动微信并保持登录。</li>
             <li>在“配置”里选择 <code>db_dir</code>（一般形如：<code>...\\xwechat_files\\&lt;wxid&gt;\\db_storage</code>）。</li>
-            <li>确认 <code>self_username</code>（用于判断“我发的消息”，避免自动回复自己）。</li>
             <li>点击“启动服务” → “打开 Web UI”。</li>
           </ol>
+          <b>当前账号（self_username）</b>
+          <ul style="margin-top:6px;margin-bottom:10px;">
+            <li>无需知道 wxid：服务会自动识别当前账号（用于判断“我发的消息”，避免自动回复自己）。</li>
+            <li>状态：{status_self}</li>
+            <li>如果识别不准：在“手动覆盖（可选）”里填写（可点“从 db_dir 推导”）。</li>
+          </ul>
           <b>小技巧</b>
           <ul style="margin-top:6px;margin-bottom:10px;">
             <li>密钥提取失败：尝试点击“以管理员身份重启”，并确保微信窗口已打开。</li>
-            <li>多账号：请确保 <code>db_dir</code> 对应当前登录账号；<code>self_username</code> 通常等于 <code>db_dir</code> 上一级文件夹名。</li>
+            <li>多账号：请确保 <code>db_dir</code> 对应当前登录账号；必要时用“手动覆盖（可选）”纠正账号识别。</li>
           </ul>
           <b>图片解密/预览（V2）</b>
           <ul style="margin-top:6px;margin-bottom:0;">
             <li>状态：<code>image_aes_key</code> {status_img}</li>
             <li>步骤：先在微信里“点开查看 2-3 张图片（大图）”，再运行图片密钥提取（README 里有 <code>find_image_key_monitor.py</code> / <code>find_image_key.py</code>），成功后重启服务。</li>
           </ul>
-          <div style="margin-top:8px;color:#9aa3c7;">当前：self_username {status_self}{('，建议值：<code>'+suggested_self+'</code>') if (not self_u and suggested_self) else ''}</div>
+          <div style="margin-top:8px;color:#9aa3c7;">提示：如果一直显示“未识别”，请先确认 <code>db_dir</code> 是否选对账号{('（可能是：<code>'+suggested_self+'</code>）') if suggested_self else ''}。</div>
         </div>
         """
         self._guide.setHtml(html)
@@ -532,7 +632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg["listen_port"] = int(self._listen_port.value())
         cfg["open_browser"] = bool(self._open_browser.isChecked())
         cfg["api_token"] = (self._api_token.text() or "").strip()
-        cfg["self_username"] = (self._self_username.text() or "").strip()
+        cfg["self_username"] = (self._self_username_override.text() or "").strip()
 
         aes = (self._image_aes_key.text() or "").strip()
         if aes:
@@ -571,19 +671,36 @@ class MainWindow(QtWidgets.QMainWindow):
     def guess_self_username(self):
         suggested = _suggest_self_username_from_db_dir(self._db_dir.text())
         if not suggested:
-            QtWidgets.QMessageBox.information(self, "提示", "无法从当前 db_dir 推导 self_username，请手动填写。")
+            QtWidgets.QMessageBox.information(
+                self,
+                "提示",
+                "无法从当前 db_dir 推导账号（wxid）。\n"
+                "请先选择正确的 db_dir，或直接启动服务后让程序自动识别当前账号。",
+            )
             return
 
-        current = (self._self_username.text() or "").strip()
+        current = (self._self_username_override.text() or "").strip()
         if current and current != suggested:
-            r = QtWidgets.QMessageBox.question(self, "确认覆盖", f"当前 self_username = {current}\n建议值 = {suggested}\n\n是否用建议值覆盖？")
+            r = QtWidgets.QMessageBox.question(
+                self,
+                "确认覆盖",
+                f"当前覆盖值 = {current}\n建议值 = {suggested}\n\n是否用建议值覆盖？",
+            )
             if r != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
 
-        self._self_username.setText(suggested)
+        self._self_username_override.setText(suggested)
 
     def open_config_folder(self):
         folder = os.path.dirname(os.path.abspath(self._config_path))
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+
+    def open_log_folder(self):
+        folder = self._log_dir or os.path.join(os.path.dirname(os.path.abspath(self._config_path)), "logs")
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
 
     # ---------------- Service ----------------
@@ -592,24 +709,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._proc.state() != QtCore.QProcess.ProcessState.NotRunning:
             return
 
+        self._state_self_username = ""
+        self._self_username_detected.setText("")
+
         self.save_config()
         cfg = load_config_soft(self._config_path)
         db_dir = (cfg.get("db_dir") or "").strip()
         if not db_dir or not os.path.isdir(db_dir):
             QtWidgets.QMessageBox.warning(self, "配置不完整", "db_dir 无效，请先选择微信 db_storage 目录。")
             return
-
-        if not (cfg.get("self_username") or "").strip():
-            suggested = _suggest_self_username_from_db_dir(db_dir)
-            hint = f"\n建议值：{suggested}" if suggested else ""
-            r = QtWidgets.QMessageBox.question(
-                self,
-                "建议填写 self_username",
-                "self_username 为空：消息方向（我发/对方发）可能不准确，自动回复也可能误判。\n"
-                f"你可以点击“自动填充”或手动填写。{hint}\n\n仍然启动服务？",
-            )
-            if r != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
 
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
@@ -761,8 +869,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_proc_output(self):
         data = bytes(self._proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        if data:
-            self._append_log(data.rstrip("\n"))
+        if not data:
+            return
+        for line in data.splitlines():
+            self._append_log(line, tag="service")
 
     def _on_proc_state_changed(self, _state):
         st = self._proc.state()
@@ -771,9 +881,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._btn_start.setEnabled(False)
             self._btn_stop.setEnabled(True)
         elif st == QtCore.QProcess.ProcessState.NotRunning:
+            self._state_self_username = ""
             self._update_status("● 未启动", ok=False)
             self._btn_start.setEnabled(True)
             self._btn_stop.setEnabled(False)
+            self._refresh_ui_from_config()
 
     def _on_proc_finished(self, exit_code, exit_status):
         self._poll_timer.stop()
@@ -781,10 +893,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log(f"[gui] exited: code={exit_code} status={exit_status}")
 
     def _poll_health(self):
-        url = self._url.text().strip().rstrip("/") + "/api/v1/health"
-        ok = _can_open_url(url)
+        base = self._url.text().strip().rstrip("/")
+        ok = _can_open_url(base + "/api/v1/health")
         if ok and self._proc.state() == QtCore.QProcess.ProcessState.Running:
             self._update_status("● 运行中（可达）", ok=True)
+            state = _get_json(base + "/api/v1/state", timeout=1.0)
+            if isinstance(state, dict):
+                new_self = (state.get("self_username") or "").strip()
+                if new_self != (self._state_self_username or ""):
+                    self._state_self_username = new_self
+                    self._self_username_detected.setText(new_self or "")
+                    self._refresh_ui_from_config()
         elif self._proc.state() == QtCore.QProcess.ProcessState.Running:
             self._update_status("● 运行中（不可达）", ok=False)
 
@@ -795,13 +914,23 @@ class MainWindow(QtWidgets.QMainWindow):
         color = "#81c784" if ok else "#ffb74d"
         self._status.setStyleSheet(f"color: {color};")
 
-    def _append_log(self, line: str):
-        self._log.appendPlainText(line)
+    def _append_log(self, line: str, *, tag: str = "gui"):
+        if line is None:
+            return
+        text = str(line)
+        if not text:
+            return
+        parts = text.splitlines() or [text]
+        for p in parts:
+            self._log.appendPlainText(p)
+            write_log_line(p, tag=tag)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv or sys.argv[1:])
     auto = "--autostart" in argv
+
+    init_app_logging("gui", config_path=get_config_path())
 
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)

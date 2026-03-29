@@ -535,8 +535,10 @@ def detect_self_username(cfg_value: str, wechat_base_dir: str, contact_names: di
     candidates = []
     if base:
         candidates.append(base)
-        if base.startswith("wxid_") and "_" in base:
-            candidates.append(base.rsplit("_", 1)[0])
+        if "_" in base:
+            head, tail = base.rsplit("_", 1)
+            if head and tail and len(tail) >= 4 and all(c in "0123456789abcdefABCDEF" for c in tail):
+                candidates.append(head)
 
     names = contact_names or {}
     for c in candidates:
@@ -3273,4 +3275,11 @@ def main():
 
 
 if __name__ == '__main__':
+    try:
+        from config import get_config_path
+        from log_utils import init_app_logging
+
+        init_app_logging("service", config_path=get_config_path())
+    except Exception:
+        pass
     main()

@@ -5,6 +5,8 @@ config.json
 decrypted/
 decoded_images/
 decoded_voices/
+logs/
+*.log
 .tmp_recent_dat_files.txt
 *.db
 *.db-shm
