@@ -10,19 +10,41 @@ import sys
 
 
 def _get_app_dir():
-    """返回可写的应用目录（优先 exe 所在目录，便于 PyInstaller 分发）。"""
+    """返回可写的应用数据目录。
+
+    设计目标（面向普通用户的安装版）：配置/日志/解密产物应放在用户目录，避免
+    - 安装目录被更新/卸载覆盖导致数据丢失
+    - 安装目录权限问题（Program Files）
+
+    兼容“解压即用/便携版”：若 exe 同目录已存在 config.json，或显式设置
+    WECHAT_DECRYPT_PORTABLE=1，则继续使用 exe 同目录。
+    """
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+        user_dir = os.path.join(appdata, "WeChatDataService")
+
+        portable = False
         try:
-            test_path = os.path.join(exe_dir, ".__writable_test__")
-            with open(test_path, "w", encoding="utf-8") as f:
-                f.write("1")
-            os.unlink(test_path)
-            return exe_dir
-        except OSError:
-            # 安装到 Program Files 等只读目录时，回退到用户目录
-            appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
-            return os.path.join(appdata, "WeChatDataService")
+            v = str(os.environ.get("WECHAT_DECRYPT_PORTABLE") or "").strip().lower()
+            if v in ("1", "true", "yes", "on"):
+                portable = True
+        except Exception:
+            portable = False
+        if os.path.isfile(os.path.join(exe_dir, "config.json")):
+            portable = True
+
+        if portable:
+            try:
+                test_path = os.path.join(exe_dir, ".__writable_test__")
+                with open(test_path, "w", encoding="utf-8") as f:
+                    f.write("1")
+                os.unlink(test_path)
+                return exe_dir
+            except OSError:
+                return user_dir
+
+        return user_dir
     return os.path.dirname(os.path.abspath(__file__))
 
 

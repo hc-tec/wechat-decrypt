@@ -40,17 +40,39 @@ if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller GUI failed with exit code $LASTEXITCODE"
 }
 
-# 避免误打包来自 Anaconda 等环境的 ICU DLL（会导致 Qt6Core.dll 依赖不匹配而无法加载）
-$IcuCandidates = @(
-  "dist\\WeChatDataServiceGUI\\_internal\\icuuc.dll",
-  "dist\\WeChatDataServiceGUI\\_internal\\icudt73.dll"
-)
-foreach ($p in $IcuCandidates) {
-  if (Test-Path $p) {
-    Remove-Item -Force $p
+# 额外生成一个 Console 版（用于排障；安装包默认不包含）。
+& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--console" "--name" "WeChatDataServiceGUIConsole" @AddBinaryArgs "gui_main.py"
+if ($LASTEXITCODE -ne 0) {
+  throw "PyInstaller GUIConsole failed with exit code $LASTEXITCODE"
+}
+
+# 避免误打包来自 Anaconda 等环境的 ICU DLL（会导致 Qt6Core.dll 依赖不匹配而无法加载）。
+# 这里把 dist 中的 icu*.dll disable 掉，防止冻结版启动时报 “DLL load failed”。
+Write-Host ""
+Write-Host "[cleanup] disable bundled ICU DLLs (best-effort)"
+& .venv-build\Scripts\python -u scripts\cleanup_icu.py "dist\\WeChatDataServiceGUI\\_internal" "dist\\WeChatDataServiceGUIConsole\\_internal"
+if ($LASTEXITCODE -ne 0) {
+  throw "cleanup_icu.py failed with exit code $LASTEXITCODE"
+}
+Start-Sleep -Milliseconds 600
+& .venv-build\Scripts\python -u scripts\cleanup_icu.py "dist\\WeChatDataServiceGUI\\_internal" "dist\\WeChatDataServiceGUIConsole\\_internal"
+if ($LASTEXITCODE -ne 0) {
+  throw "cleanup_icu.py failed with exit code $LASTEXITCODE"
+}
+
+$Left = @()
+foreach ($d in @("dist\\WeChatDataServiceGUI\\_internal", "dist\\WeChatDataServiceGUIConsole\\_internal")) {
+  Get-ChildItem -Path (Join-Path $d "icu*.dll") -ErrorAction SilentlyContinue | ForEach-Object {
+    $Left += $_.FullName
   }
+}
+if ($Left.Count -gt 0) {
+  Write-Host ("[cleanup] WARN: ICU DLL still present:`n  " + ($Left -join "`n  "))
+} else {
+  Write-Host "[cleanup] OK"
 }
 
 Write-Host ""
 Write-Host "Built: dist\\WeChatDataService\\WeChatDataService.exe"
 Write-Host "Built: dist\\WeChatDataServiceGUI\\WeChatDataServiceGUI.exe"
+Write-Host "Built: dist\\WeChatDataServiceGUIConsole\\WeChatDataServiceGUIConsole.exe"

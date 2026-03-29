@@ -10,8 +10,9 @@
 - 进一步封装：用 Inno Setup / NSIS 做 `Setup.exe`，安装到用户目录并创建桌面快捷方式
 
 说明：
-- 可执行文件所在目录可写时：`config.json` / `all_keys.json` 默认放在 exe 同目录（便于“解压即用”）。
-- 安装到 `Program Files` 等只读目录时：会自动改为用户目录：`%APPDATA%\\WeChatDataService\\`。
+- **安装版默认**：配置/日志/解密产物放在用户目录：`%APPDATA%\\WeChatDataService\\`（避免 Program Files 权限与更新覆盖）。
+- **便携版（解压即用）**：若 exe 同目录存在 `config.json`，或设置环境变量 `WECHAT_DECRYPT_PORTABLE=1`，则继续使用 exe 同目录存放数据。
+- 打包 Qt 时会清理 `icu*.dll`（常见于误从 Anaconda 带入 ICU 导致 Qt 启动失败）；构建脚本已内置该清理。
 
 ## 用户使用流程（建议写到你的产品说明里）
 
