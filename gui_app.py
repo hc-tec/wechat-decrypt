@@ -3,7 +3,6 @@ import sys
 import json
 import urllib.request
 import re
-from collections import deque
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
@@ -145,8 +144,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cfg = load_config_soft(self._config_path)
 
         self._proc = QtCore.QProcess(self)
-        self._proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
-        self._proc.readyReadStandardOutput.connect(self._on_proc_output)
+        self._proc.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.SeparateChannels)
+        try:
+            self._proc.errorOccurred.connect(self._on_proc_error)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         self._proc.stateChanged.connect(self._on_proc_state_changed)
         self._proc.finished.connect(self._on_proc_finished)
 
@@ -171,15 +173,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_initial_window_geometry()
         self._refresh_ui_from_config()
         self._refresh_autostart_ui()
-
-        # Service stdout is very chatty; buffer+throttle UI updates to keep GUI responsive.
-        self._svc_out_queue = deque()
-        self._svc_out_chars = 0
-        self._svc_out_drops = 0
-        self._svc_out_timer = QtCore.QTimer(self)
-        self._svc_out_timer.setInterval(80)
-        self._svc_out_timer.timeout.connect(self._flush_service_output)
-        self._svc_out_timer.start()
 
         if self._auto_start_service:
             QtCore.QTimer.singleShot(200, self.start_service)
@@ -492,6 +485,22 @@ class MainWindow(QtWidgets.QMainWindow):
         adv_l.addWidget(QtWidgets.QLabel("image_xor_key（图片 V2）"), row, 0)
         adv_l.addWidget(self._image_xor_key, row, 1, 1, 3)
 
+        row += 1
+        adv_l.addWidget(QtWidgets.QLabel("日志目录"), row, 0)
+        self._log_dir_view = QtWidgets.QLineEdit()
+        self._log_dir_view.setReadOnly(True)
+        self._log_dir_view.setText(self._log_dir or "")
+        adv_l.addWidget(self._log_dir_view, row, 1, 1, 2)
+        self._btn_open_logs = QtWidgets.QPushButton("打开")
+        self._btn_open_logs.clicked.connect(self.open_log_folder)
+        adv_l.addWidget(self._btn_open_logs, row, 3)
+
+        row += 1
+        adv_l.addWidget(QtWidgets.QLabel("诊断信息"), row, 0)
+        self._btn_copy_diag = QtWidgets.QPushButton("复制到剪贴板")
+        self._btn_copy_diag.clicked.connect(self.copy_diagnostics)
+        adv_l.addWidget(self._btn_copy_diag, row, 1, 1, 3)
+
         adv_root = QtWidgets.QVBoxLayout(self._advanced_group)
         adv_root.setContentsMargins(12, 10, 12, 10)
         adv_root.addWidget(self._advanced_content)
@@ -502,36 +511,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         control_l.addWidget(cfg_group)
         control_l.addStretch(1)
-
-        # ---------------- 日志页 ----------------
-        # Logs
-        log_group = QtWidgets.QGroupBox("日志")
-        log_l = QtWidgets.QVBoxLayout(log_group)
-        log_top = QtWidgets.QHBoxLayout()
-        self._log_path_view = QtWidgets.QLineEdit()
-        self._log_path_view.setReadOnly(True)
-        self._log_path_view.setText(self._log_path or "")
-        self._btn_open_logs = QtWidgets.QPushButton("打开日志文件夹")
-        self._btn_open_logs.clicked.connect(self.open_log_folder)
-        log_top.addWidget(self._log_path_view, 1)
-        log_top.addWidget(self._btn_open_logs)
-        log_l.addLayout(log_top)
-        self._log = QtWidgets.QPlainTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setUndoRedoEnabled(False)
-        try:
-            self._log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-        except Exception:
-            pass
-        self._log.setMaximumBlockCount(2000)
-        log_l.addWidget(self._log)
-
-        tab_logs = QtWidgets.QWidget()
-        tabs.addTab(tab_logs, "日志")
-        tab_logs_l = QtWidgets.QVBoxLayout(tab_logs)
-        tab_logs_l.setContentsMargins(0, 0, 0, 0)
-        tab_logs_l.setSpacing(12)
-        tab_logs_l.addWidget(log_group, 1)
 
     def _apply_theme(self):
         self.setStyleSheet(
@@ -760,6 +739,64 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
 
+    def copy_diagnostics(self):
+        cfg = read_config_file(self._config_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        host = (cfg.get("listen_host") or "127.0.0.1").strip() or "127.0.0.1"
+        try:
+            port = int(cfg.get("listen_port") or 5678)
+        except Exception:
+            port = 5678
+        url_host = "localhost" if host in ("0.0.0.0", "127.0.0.1", "::") else host
+        base_url = f"http://{url_host}:{port}"
+
+        db_dir = (cfg.get("db_dir") or "").strip()
+        detected = (self._state_self_username or "").strip()
+        override_u = (cfg.get("self_username") or "").strip()
+
+        running = self._proc.state() == QtCore.QProcess.ProcessState.Running
+        try:
+            frozen = _is_frozen()
+        except Exception:
+            frozen = False
+
+        service_exe = ""
+        if frozen:
+            service_exe = _find_service_exe()
+
+        log_dir = self._log_dir or ""
+        gui_log = self._log_path or ""
+        service_console = (
+            os.path.join(log_dir, "service-console.log") if log_dir else "service-console.log"
+        )
+        service_log = os.path.join(log_dir, "service.log") if log_dir else "service.log"
+
+        lines = [
+            f"app={APP_TITLE}",
+            f"qt={QT_LIB}",
+            f"pid={os.getpid()}",
+            f"python={sys.version.split()[0]}",
+            f"frozen={frozen}",
+            f"config_path={os.path.abspath(self._config_path)}",
+            f"log_dir={log_dir}",
+            f"gui_log={gui_log}",
+            f"service_log={service_log}",
+            f"service_console_log={service_console}",
+            f"service_exe={service_exe}",
+            f"service_running={running}",
+            f"listen={host}:{port}",
+            f"base_url={base_url}",
+            f"db_dir={db_dir}",
+            f"db_dir_exists={bool(db_dir and os.path.isdir(db_dir))}",
+            f"self_username_detected={detected}",
+            f"self_username_override={override_u}",
+        ]
+
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+        QtWidgets.QMessageBox.information(self, "已复制", "已复制诊断信息到剪贴板。")
+
     # ---------------- Service ----------------
 
     def start_service(self):
@@ -781,6 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("WECHAT_DECRYPT_CONFIG", os.path.abspath(self._config_path))
         # 服务端不应主动弹浏览器；GUI 按需控制
         env.insert("WECHAT_DECRYPT_NO_BROWSER", "1")
         self._proc.setProcessEnvironment(env)
@@ -789,6 +827,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._auto_open_web_pending = bool(cfg.get("open_browser", False)) and (not self._auto_start_service)
         except Exception:
             self._auto_open_web_pending = False
+
+        # 不在 GUI 里展示服务的实时 stdout（会影响性能）；输出落盘供排障用。
+        try:
+            console_log = os.path.join(self._log_dir or os.path.dirname(os.path.abspath(self._config_path)), "service-console.log")
+            self._proc.setStandardOutputFile(console_log, QtCore.QIODevice.OpenModeFlag.Append)
+            self._proc.setStandardErrorFile(console_log, QtCore.QIODevice.OpenModeFlag.Append)
+        except Exception:
+            pass
 
         if _is_frozen():
             service_exe = _find_service_exe()
@@ -933,10 +979,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- Process callbacks ----------------
 
-    def _on_proc_output(self):
-        data = bytes(self._proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        if data:
-            self._enqueue_service_output(data)
+    def _on_proc_error(self, err):
+        try:
+            name = getattr(err, "name", None) or str(err)
+        except Exception:
+            name = "unknown"
+        self._append_log(f"[gui] process error: {name}")
+        msg = f"服务异常: {name}\n请在“高级设置 → 日志目录”查看日志。"
+        try:
+            if self.isVisible():
+                QtWidgets.QMessageBox.warning(self, "服务异常", msg)
+            elif self._tray:
+                self._tray.showMessage(APP_TITLE, msg, QtWidgets.QSystemTrayIcon.MessageIcon.Warning, 5000)
+        except Exception:
+            pass
 
     def _on_proc_state_changed(self, _state):
         st = self._proc.state()
@@ -991,64 +1047,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._update_status("● 运行中（不可达）", ok=False)
 
-    def _enqueue_service_output(self, text: str):
-        if not text:
-            return
-
-        # Normalize newlines for consistent rendering in QPlainTextEdit.
-        text = text.replace("\r\n", "\n")
-
-        max_chars = 200_000
-        if len(text) > max_chars:
-            text = text[-max_chars:]
-            self._svc_out_queue.clear()
-            self._svc_out_chars = 0
-            self._svc_out_drops += 1
-
-        incoming = len(text)
-        while self._svc_out_queue and (self._svc_out_chars + incoming) > max_chars:
-            old = self._svc_out_queue.popleft()
-            self._svc_out_chars -= len(old)
-            self._svc_out_drops += 1
-
-        self._svc_out_queue.append(text)
-        self._svc_out_chars += incoming
-
-    def _flush_service_output(self):
-        if not getattr(self, "_svc_out_queue", None):
-            return
-        if not self._svc_out_queue:
-            return
-
-        flush_limit = 12_000
-        parts = []
-        chars = 0
-        while self._svc_out_queue and chars < flush_limit:
-            p = self._svc_out_queue.popleft()
-            self._svc_out_chars -= len(p)
-            parts.append(p)
-            chars += len(p)
-        out = "".join(parts)
-        if self._svc_out_drops:
-            out = (
-                f"[gui] 服务输出过多，已丢弃 {self._svc_out_drops} 段（完整日志请看 service.log）\n"
-                + out
-            )
-            self._svc_out_drops = 0
-
-        try:
-            self._log.setUpdatesEnabled(False)
-            cur = self._log.textCursor()
-            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-            cur.insertText(out)
-            self._log.setTextCursor(cur)
-            self._log.ensureCursorVisible()
-        finally:
-            try:
-                self._log.setUpdatesEnabled(True)
-            except Exception:
-                pass
-
     # ---------------- helpers ----------------
 
     def _update_status(self, text: str, ok: bool):
@@ -1064,7 +1062,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         parts = text.splitlines() or [text]
         for p in parts:
-            self._log.appendPlainText(p)
             write_log_line(p, tag=tag)
 
 
