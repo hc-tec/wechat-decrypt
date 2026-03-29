@@ -156,6 +156,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_tray()
 
         self._state_self_username = ""
+        self._stop_requested = False
 
         self._health_pending = False
         self._health_emitter = _HealthEmitter()
@@ -807,6 +808,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._self_username_detected.setText("")
         self._auto_open_web_pending = False
         self._auto_open_web_done = False
+        self._stop_requested = False
 
         self.save_config()
         cfg = load_config_soft(self._config_path)
@@ -859,7 +861,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def stop_service(self):
         if self._proc.state() == QtCore.QProcess.ProcessState.NotRunning:
             return
+        self._stop_requested = True
         self._append_log("[gui] stop requested")
+        self._update_status("● 停止中…", ok=False)
         self._proc.terminate()
         QtCore.QTimer.singleShot(2200, self._kill_if_needed)
 
@@ -985,6 +989,16 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             name = "unknown"
         self._append_log(f"[gui] process error: {name}")
+
+        # 用户主动停止/退出时，Windows 上强杀会触发 Crashed；这不是“异常”，不弹窗打扰。
+        try:
+            if self._stop_requested and (
+                err == QtCore.QProcess.ProcessError.Crashed or str(name).lower() == "crashed"
+            ):
+                return
+        except Exception:
+            pass
+
         msg = f"服务异常: {name}\n请在“高级设置 → 日志目录”查看日志。"
         try:
             if self.isVisible():
@@ -1002,15 +1016,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._btn_stop.setEnabled(True)
         elif st == QtCore.QProcess.ProcessState.NotRunning:
             self._state_self_username = ""
-            self._update_status("● 未启动", ok=False)
             self._btn_start.setEnabled(True)
             self._btn_stop.setEnabled(False)
             self._refresh_ui_from_config()
 
     def _on_proc_finished(self, exit_code, exit_status):
         self._poll_timer.stop()
-        self._update_status(f"● 已退出 (code={exit_code})", ok=False)
+        if self._stop_requested:
+            self._update_status("● 已停止", ok=False)
+        else:
+            self._update_status(f"● 已退出 (code={exit_code})", ok=False)
         self._append_log(f"[gui] exited: code={exit_code} status={exit_status}")
+        self._stop_requested = False
 
     def _poll_health(self):
         if self._proc.state() != QtCore.QProcess.ProcessState.Running:
