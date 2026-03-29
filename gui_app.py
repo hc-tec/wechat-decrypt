@@ -130,15 +130,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.resize(980, 680)
             return
 
-        margin = 40
-        max_w = max(480, int(g.width() - margin))
-        max_h = max(360, int(g.height() - margin))
+        # 预留足够边距给窗口边框/任务栏/多屏场景，避免“窗口比屏幕还高”。
+        margin = 96
+        max_w = max(420, int(g.width() - margin))
+        max_h = max(320, int(g.height() - margin))
 
-        target_w = min(980, int(g.width() * 0.92))
-        target_h = min(680, int(g.height() * 0.85))
+        # 初始窗口尽量“不会遮住屏幕”，同时在大屏上也不要太夸张。
+        target_w = min(980, int(max_w * 0.98))
+        target_h = min(620, int(max_h * 0.78))
 
-        target_w = max(720, min(target_w, max_w))
-        target_h = max(520, min(target_h, max_h))
+        min_w = min(760, max_w)
+        min_h = min(460, max_h)
+
+        target_w = min(max_w, max(min_w, target_w))
+        target_h = min(max_h, max(min_h, target_h))
 
         self.resize(target_w, target_h)
         try:
@@ -179,6 +184,28 @@ class MainWindow(QtWidgets.QMainWindow):
         header.addWidget(self._status)
         layout.addLayout(header)
 
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        # ---------------- 控制页（可滚动） ----------------
+        tab_control = QtWidgets.QWidget()
+        tabs.addTab(tab_control, "控制")
+        tab_control_l = QtWidgets.QVBoxLayout(tab_control)
+        tab_control_l.setContentsMargins(0, 0, 0, 0)
+        tab_control_l.setSpacing(0)
+
+        control_scroll = QtWidgets.QScrollArea()
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        tab_control_l.addWidget(control_scroll)
+
+        control_root = QtWidgets.QWidget()
+        control_scroll.setWidget(control_root)
+
+        control_l = QtWidgets.QVBoxLayout(control_root)
+        control_l.setContentsMargins(0, 0, 0, 0)
+        control_l.setSpacing(12)
+
         # Autostart (top priority for non-technical users)
         autostart_group = QtWidgets.QGroupBox("开机自启")
         autostart_l = QtWidgets.QHBoxLayout(autostart_group)
@@ -189,7 +216,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chk_autostart.toggled.connect(self.on_toggle_autostart)
         autostart_l.addWidget(self._chk_autostart)
         autostart_l.addStretch(1)
-        layout.addWidget(autostart_group)
+        control_l.addWidget(autostart_group)
 
         # Guide
         guide_group = QtWidgets.QGroupBox("使用引导（常见问题与小技巧）")
@@ -205,7 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         guide_l.addWidget(self._guide)
-        layout.addWidget(guide_group)
+        control_l.addWidget(guide_group)
 
         # Service controls
         svc_group = QtWidgets.QGroupBox("服务")
@@ -244,7 +271,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hint.setObjectName("hint")
         svc_l.addWidget(self._hint, 2, 0, 1, 4)
 
-        layout.addWidget(svc_group)
+        control_l.addWidget(svc_group)
 
         # Config
         cfg_group = QtWidgets.QGroupBox("配置")
@@ -351,8 +378,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cfg_root.addWidget(self._advanced_group)
 
-        layout.addWidget(cfg_group)
+        control_l.addWidget(cfg_group)
+        control_l.addStretch(1)
 
+        # ---------------- 日志页 ----------------
         # Logs
         log_group = QtWidgets.QGroupBox("日志")
         log_l = QtWidgets.QVBoxLayout(log_group)
@@ -360,7 +389,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(2000)
         log_l.addWidget(self._log)
-        layout.addWidget(log_group, 1)
+
+        tab_logs = QtWidgets.QWidget()
+        tabs.addTab(tab_logs, "日志")
+        tab_logs_l = QtWidgets.QVBoxLayout(tab_logs)
+        tab_logs_l.setContentsMargins(0, 0, 0, 0)
+        tab_logs_l.setSpacing(12)
+        tab_logs_l.addWidget(log_group, 1)
 
     def _apply_theme(self):
         self.setStyleSheet(
