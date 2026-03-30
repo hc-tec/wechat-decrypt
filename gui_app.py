@@ -1578,6 +1578,10 @@ class ImageKeyWizard(QtWidgets.QDialog):
 
         self._stop_event.clear()
         self._status.setText("准备扫描…")
+        try:
+            self._mw._append_log(f"[imgkey] start scan: process={proc} db_dir={db_dir}", tag="gui")
+        except Exception:
+            pass
         self._set_running(True)
         try:
             QtCore.QThreadPool.globalInstance().start(
@@ -1599,6 +1603,10 @@ class ImageKeyWizard(QtWidgets.QDialog):
 
     def _on_progress(self, msg: str):
         self._status.setText(str(msg))
+        try:
+            self._mw._append_log(f"[imgkey] {msg}", tag="gui")
+        except Exception:
+            pass
 
     def _on_done(self, ok: bool, payload):
         self._set_running(False)
@@ -1610,6 +1618,10 @@ class ImageKeyWizard(QtWidgets.QDialog):
                 + "若微信进程名不是 Weixin.exe 可在 config.json 的 wechat_process 修改后重试。"
             )
             self._status.setText(msg)
+            try:
+                self._mw._append_log(f"[imgkey] failed: {msg}", tag="gui")
+            except Exception:
+                pass
             QtWidgets.QMessageBox.warning(self, "未成功", msg)
             return
 
@@ -1628,6 +1640,11 @@ class ImageKeyWizard(QtWidgets.QDialog):
             return
 
         self._mw.set_image_keys(aes, int(xor) if isinstance(xor, int) else None)
+        try:
+            xor_text = f"0x{int(xor):02X}" if isinstance(xor, int) else "unknown"
+            self._mw._append_log(f"[imgkey] success: aes_len={len(aes)} xor={xor_text}", tag="gui")
+        except Exception:
+            pass
         QtWidgets.QMessageBox.information(self, "完成", "已保存图片密钥到配置。现在可以尝试打开调试页查看图片。")
         self.accept()
 
@@ -1648,5 +1665,10 @@ class ImageKeyWizard(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "提示", "XOR key 必须是 0-255 的数字（支持 0xA2）。")
                 return
         self._mw.set_image_keys(aes, xor_val)
+        try:
+            xor_text = f"0x{int(xor_val):02X}" if isinstance(xor_val, int) else "unknown"
+            self._mw._append_log(f"[imgkey] manual save: aes_len={len(aes)} xor={xor_text}", tag="gui")
+        except Exception:
+            pass
         QtWidgets.QMessageBox.information(self, "完成", "已保存。")
         self.accept()

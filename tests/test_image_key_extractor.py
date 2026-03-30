@@ -79,6 +79,27 @@ class ImageKeyExtractorTests(unittest.TestCase):
         blob_be = b"\x33\x00" + key_str.encode("utf-16be") + b"\x00\x44"
         self.assertEqual(key_str, ike.find_aes_key_in_blob(blob_be, ciphertext))
 
+    def test_enum_regions_does_not_break_on_baseaddress_zero(self):
+        import image_key_extractor as ike
+
+        if os.name != "nt":
+            self.skipTest("Windows only")
+
+        pid = os.getpid()
+        access = ike._PROCESS_VM_READ | ike._PROCESS_QUERY_INFORMATION  # noqa: SLF001
+        h_process = ike._kernel32.OpenProcess(int(access), False, int(pid))  # noqa: SLF001
+        if not h_process:
+            self.skipTest("OpenProcess failed in test environment")
+
+        try:
+            regs = ike._enum_regions(h_process)  # noqa: SLF001
+            self.assertGreater(len(regs), 0)
+        finally:
+            try:
+                ike._kernel32.CloseHandle(h_process)  # noqa: SLF001
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

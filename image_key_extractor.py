@@ -336,8 +336,14 @@ def _enum_regions(h_process) -> list[tuple[int, int, int]]:
         )
         if result == 0:
             break
+        # 注意：当 BaseAddress 为 0 时，ctypes 会把 c_void_p(0) 显示为 None。
+        # 不能直接 int(None)；否则会导致首次查询就提前 break，进而扫描不到任何内存区域。
+        base_raw = getattr(mbi, "BaseAddress", None)
         try:
-            base = int(mbi.BaseAddress)  # type: ignore[arg-type]
+            base = int(base_raw) if base_raw is not None else 0
+        except Exception:
+            base = 0
+        try:
             size = int(mbi.RegionSize)
             state = int(mbi.State)
             protect = int(mbi.Protect)
