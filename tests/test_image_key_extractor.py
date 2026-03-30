@@ -63,7 +63,22 @@ class ImageKeyExtractorTests(unittest.TestCase):
 
         self.assertTrue(ike._try_key(key, ciphertext))  # noqa: SLF001
 
+    def test_find_aes_key_in_blob_supports_utf16(self):
+        import image_key_extractor as ike
+
+        from Crypto.Cipher import AES
+
+        key_str = "0123456789abcdef"
+        key = key_str.encode("ascii")
+        plain = b"\xFF\xD8\xFF" + (b"\x00" * 13)
+        ciphertext = AES.new(key, AES.MODE_ECB).encrypt(plain)
+
+        blob_le = b"\x00\x11" + key_str.encode("utf-16le") + b"\x22\x00"
+        self.assertEqual(key_str, ike.find_aes_key_in_blob(blob_le, ciphertext))
+
+        blob_be = b"\x33\x00" + key_str.encode("utf-16be") + b"\x00\x44"
+        self.assertEqual(key_str, ike.find_aes_key_in_blob(blob_be, ciphertext))
+
 
 if __name__ == "__main__":
     unittest.main()
-

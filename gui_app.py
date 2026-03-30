@@ -147,6 +147,7 @@ class _ImageKeyWorker(QtCore.QRunnable):
                 process_name=self._process_name,
                 stop_check=self._stop_event.is_set,
                 progress=_progress,
+                timeout_seconds=180,
             )
             ok = True
             payload = {"aes_key": aes, "xor_key": xor}
@@ -1488,11 +1489,14 @@ class ImageKeyWizard(QtWidgets.QDialog):
         auto_l = QtWidgets.QVBoxLayout(tab_auto)
         auto_l.setSpacing(10)
 
-        hint = QtWidgets.QLabel("步骤：在微信里点开 2-3 张图片（大图）→ 回到这里点“开始扫描”。")
+        hint = QtWidgets.QLabel(
+            "点“开始扫描”后，你可以去微信打开 2-3 张图片（大图）并保持打开；"
+            "本程序会持续扫描约 3 分钟，找到后自动保存。"
+        )
         hint.setWordWrap(True)
         auto_l.addWidget(hint)
 
-        self._chk_ready = QtWidgets.QCheckBox("我已在微信打开图片（大图）")
+        self._chk_ready = QtWidgets.QCheckBox("如果已打开图片（大图），会更快（可选）")
         auto_l.addWidget(self._chk_ready)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -1555,16 +1559,13 @@ class ImageKeyWizard(QtWidgets.QDialog):
 
     def _set_running(self, running: bool) -> None:
         self._running = bool(running)
-        self._btn_start.setEnabled((not self._running) and bool(self._chk_ready.isChecked()))
+        self._btn_start.setEnabled(not self._running)
         self._chk_ready.setEnabled(not self._running)
         self._btn_cancel.setText("取消" if self._running else "关闭")
         self._bar.setVisible(self._running)
 
     def _start_scan(self):
         if self._running:
-            return
-        if not self._chk_ready.isChecked():
-            QtWidgets.QMessageBox.information(self, "提示", "请先在微信里点开 2-3 张图片（大图）。")
             return
 
         cfg = load_config_soft(self._mw._config_path)
@@ -1603,6 +1604,11 @@ class ImageKeyWizard(QtWidgets.QDialog):
         self._set_running(False)
         if not ok:
             msg = str(payload or "失败")
+            msg = (
+                msg
+                + "\n\n建议：保持图片“大图”窗口打开；若提示权限不足请回主界面点“管理员运行”；"
+                + "若微信进程名不是 Weixin.exe 可在 config.json 的 wechat_process 修改后重试。"
+            )
             self._status.setText(msg)
             QtWidgets.QMessageBox.warning(self, "未成功", msg)
             return

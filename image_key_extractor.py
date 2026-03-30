@@ -27,6 +27,11 @@ _V2_MAGIC = b"\x07\x08V2\x08\x07"
 # 正则：精确 32/16 字符 alphanum（前后是非 alphanum 或边界）
 _RE_KEY32 = re.compile(rb"(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])")
 _RE_KEY16 = re.compile(rb"(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])")
+# UTF-16（微信内部很多字符串可能是 wchar_t / UTF-16LE/BE）
+_RE_KEY32_UTF16LE = re.compile(rb"(?:[a-zA-Z0-9]\x00){32}")
+_RE_KEY16_UTF16LE = re.compile(rb"(?:[a-zA-Z0-9]\x00){16}")
+_RE_KEY32_UTF16BE = re.compile(rb"(?:\x00[a-zA-Z0-9]){32}")
+_RE_KEY16_UTF16BE = re.compile(rb"(?:\x00[a-zA-Z0-9]){16}")
 
 
 def _safe_mtime(path: str) -> float:
@@ -190,24 +195,94 @@ def _try_key(key_bytes: bytes, ciphertext16: bytes) -> bool:
     except Exception:
         raise ImageKeyError("缺少依赖：pycryptodome", code="dependency")
 
+    def _is_known_header(dec: bytes) -> bool:
+        if not dec:
+            return False
+        # 常见图片 magic（尽量覆盖 WeChat 常见格式）
+        if dec[:3] == b"\xFF\xD8\xFF":  # JPEG
+            return True
+        if dec[:4] == b"\x89PNG":
+            return True
+        if dec[:4] == b"RIFF":  # WEBP
+            return True
+        if dec[:4] == b"wxgf":  # HEVC (wxgf)
+            return True
+        if dec[:3] == b"GIF":
+            return True
+        if dec[:2] == b"BM":  # BMP
+            return True
+        if dec[:4] == b"II*\x00":  # TIFF (little-endian)
+            return True
+        return False
+
+    # 先尝试 AES-128（key 前 16 字节），这是最常见的情况
     try:
         cipher = AES.new(key_bytes[:16], AES.MODE_ECB)
         dec = cipher.decrypt(ciphertext16)
+        if _is_known_header(dec):
+            return True
     except Exception:
-        return False
+        pass
 
-    # 常见图片 magic
-    if dec[:3] == b"\xFF\xD8\xFF":  # JPEG
-        return True
-    if dec[:4] == b"\x89PNG":
-        return True
-    if dec[:4] == b"RIFF":  # WEBP
-        return True
-    if dec[:4] == b"wxgf":  # HEVC (wxgf)
-        return True
-    if dec[:3] == b"GIF":
-        return True
+    # 兜底：尝试把整段 key 当作 AES key（可能是 24/32 字节）
+    try:
+        if len(key_bytes) in (16, 24, 32):
+            cipher = AES.new(key_bytes, AES.MODE_ECB)
+            dec = cipher.decrypt(ciphertext16)
+            if _is_known_header(dec):
+                return True
+    except Exception:
+        pass
+
     return False
+
+
+def find_aes_key_in_blob(blob: bytes, ciphertext16: bytes) -> str | None:
+    """在一段 bytes 中查找可用于解密 V2 图片的 AES key（best-effort）。"""
+    if not blob or len(blob) < 32:
+        return None
+    if not ciphertext16 or len(ciphertext16) != 16:
+        return None
+
+    # 32-char ASCII（先试前 16 做 AES-128；再试完整 32 做 AES-256）
+    for m in _RE_KEY32.finditer(blob):
+        key_bytes = m.group()
+        if _try_key(key_bytes[:16], ciphertext16):
+            return key_bytes[:16].decode("ascii", errors="ignore")
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+
+    # 16-char ASCII
+    for m in _RE_KEY16.finditer(blob):
+        key_bytes = m.group()
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+
+    # 32-char UTF-16LE/BE
+    for m in _RE_KEY32_UTF16LE.finditer(blob):
+        key_bytes = m.group()[::2]
+        if _try_key(key_bytes[:16], ciphertext16):
+            return key_bytes[:16].decode("ascii", errors="ignore")
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+    for m in _RE_KEY32_UTF16BE.finditer(blob):
+        key_bytes = m.group()[1::2]
+        if _try_key(key_bytes[:16], ciphertext16):
+            return key_bytes[:16].decode("ascii", errors="ignore")
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+
+    # 16-char UTF-16LE/BE
+    for m in _RE_KEY16_UTF16LE.finditer(blob):
+        key_bytes = m.group()[::2]
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+    for m in _RE_KEY16_UTF16BE.finditer(blob):
+        key_bytes = m.group()[1::2]
+        if _try_key(key_bytes, ciphertext16):
+            return key_bytes.decode("ascii", errors="ignore")
+
+    return None
 
 
 # Windows API constants
@@ -283,6 +358,7 @@ def scan_memory_for_aes_key(
     pid: int,
     ciphertext16: bytes,
     *,
+    scan_all: bool = True,
     stop_check: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> str | None:
@@ -321,30 +397,24 @@ def scan_memory_for_aes_key(
                         continue
 
                     buf = tail + data
-                    # 32-char candidates
-                    for m in _RE_KEY32.finditer(buf):
-                        key_bytes = m.group()
-                        if _try_key(key_bytes[:16], ciphertext16):
-                            return key_bytes[:16].decode("ascii", errors="ignore")
-                        if _try_key(key_bytes, ciphertext16):
-                            return key_bytes.decode("ascii", errors="ignore")
-                    # 16-char candidates
-                    for m in _RE_KEY16.finditer(buf):
-                        key_bytes = m.group()
-                        if _try_key(key_bytes, ciphertext16):
-                            return key_bytes.decode("ascii", errors="ignore")
+                    key = find_aes_key_in_blob(buf, ciphertext16)
+                    if key:
+                        return key
 
                     tail = buf[-overlap:] if len(buf) > overlap else buf
             return None
 
         if progress:
-            progress("Phase 1/2：扫描 RW 内存")
+            progress("Phase 1：扫描 RW 内存（更快）")
         found = _scan(rw_regs)
         if found:
             return found
 
+        if not scan_all:
+            return None
+
         if progress:
-            progress("Phase 2/2：扫描其它可读内存")
+            progress("Phase 2：扫描其它可读内存（更慢，兜底）")
         return _scan(other_regs)
     finally:
         try:
@@ -359,6 +429,7 @@ def extract_image_keys(
     process_name: str = "Weixin.exe",
     stop_check: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    timeout_seconds: int = 180,
 ) -> tuple[str, int | None]:
     """提取图片 V2 的 AES key + XOR key（XOR 可能为 None）。"""
     db_dir = os.path.abspath(os.path.expanduser((db_dir or "").strip()))
@@ -376,17 +447,71 @@ def extract_image_keys(
 
     pids = get_wechat_pids(process_name=process_name)
     if not pids:
+        # 兼容不同发行版的进程名
+        fallback = "WeChat.exe" if process_name.lower() == "weixin.exe" else "Weixin.exe"
+        pids = get_wechat_pids(process_name=fallback)
+    if not pids:
         raise ImageKeyError("未检测到微信进程，请先启动微信并登录。", code="wechat_not_running")
+
+    if progress:
+        ct_name = str(_ct_file or "")
+        if ct_name and xor_key is not None:
+            progress(f"已找到 V2 缓存：{ct_name}（XOR=0x{int(xor_key):02X}）")
+        elif ct_name:
+            progress(f"已找到 V2 缓存：{ct_name}")
 
     perm_errors = 0
     last_err: Exception | None = None
+
+    # 监控式扫描：允许用户“点开始→去微信打开图片→回来等”，提高成功率
+    deadline = time.time() + max(10, int(timeout_seconds or 0))
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        for pid in pids[:3]:
+            if stop_check and stop_check():
+                raise ImageKeyCancelled()
+            try:
+                if progress:
+                    progress(f"扫描中（第 {attempt} 次）… PID {pid}")
+                aes_key = scan_memory_for_aes_key(
+                    pid,
+                    ciphertext,
+                    scan_all=False,
+                    stop_check=stop_check,
+                    progress=progress,
+                )
+                if aes_key:
+                    return aes_key, xor_key
+            except ImageKeyCancelled:
+                raise
+            except ImageKeyError as e:
+                last_err = e
+                if e.code == "permission":
+                    perm_errors += 1
+                continue
+            except Exception as e:
+                last_err = e
+                continue
+
+        if progress:
+            progress("未找到密钥：现在可以去微信点开图片（大图）并保持打开，本程序会继续扫描…")
+        time.sleep(2.0)
+
+    # 最后再兜底扫一次“全可读内存”（更慢）
     for pid in pids[:3]:
         if stop_check and stop_check():
             raise ImageKeyCancelled()
         try:
             if progress:
-                progress(f"扫描 PID {pid}…")
-            aes_key = scan_memory_for_aes_key(pid, ciphertext, stop_check=stop_check, progress=progress)
+                progress(f"兜底扫描（更慢）… PID {pid}")
+            aes_key = scan_memory_for_aes_key(
+                pid,
+                ciphertext,
+                scan_all=True,
+                stop_check=stop_check,
+                progress=progress,
+            )
             if aes_key:
                 return aes_key, xor_key
         except ImageKeyCancelled:
@@ -405,5 +530,4 @@ def extract_image_keys(
 
     if last_err:
         raise ImageKeyError(f"提取失败：{last_err}", code="failed")
-    raise ImageKeyError("未找到 AES key。请先在微信点开几张图片（大图），然后立即重试。", code="not_found")
-
+    raise ImageKeyError("未找到 AES key。请在微信点开图片（大图）并保持打开，然后重试。", code="not_found")
