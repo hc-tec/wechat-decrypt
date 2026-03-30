@@ -35,13 +35,13 @@ foreach ($dll in $ExtraQtDlls) {
   }
 }
 
-& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--noconsole" "--name" "WeChatDataServiceGUI" @AddBinaryArgs "gui_main.py"
+& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--noconsole" "--name" "WeChatDataServiceGUI" "--hidden-import" "image_key_extractor" @AddBinaryArgs "gui_main.py"
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller GUI failed with exit code $LASTEXITCODE"
 }
 
 # 额外生成一个 Console 版（用于排障；安装包默认不包含）。
-& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--console" "--name" "WeChatDataServiceGUIConsole" @AddBinaryArgs "gui_main.py"
+& .venv-build\Scripts\pyinstaller "--noconfirm" "--clean" "--onedir" "--console" "--name" "WeChatDataServiceGUIConsole" "--hidden-import" "image_key_extractor" @AddBinaryArgs "gui_main.py"
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller GUIConsole failed with exit code $LASTEXITCODE"
 }

@@ -3,6 +3,7 @@ import sys
 import json
 import urllib.request
 import re
+import threading
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
@@ -104,6 +105,57 @@ class _HealthWorker(QtCore.QRunnable):
         try:
             if getattr(self._emitter, "done", None):
                 self._emitter.done.emit(bool(ok), state)
+        except Exception:
+            pass
+
+
+class _ImageKeyEmitter(QtCore.QObject):
+    progress = _Signal(str) if _Signal else None  # type: ignore[misc]
+    done = _Signal(bool, object) if _Signal else None  # type: ignore[misc]
+
+
+class _ImageKeyWorker(QtCore.QRunnable):
+    def __init__(
+        self,
+        emitter: _ImageKeyEmitter,
+        *,
+        db_dir: str,
+        process_name: str,
+        stop_event: threading.Event,
+    ):
+        super().__init__()
+        self._emitter = emitter
+        self._db_dir = db_dir
+        self._process_name = process_name
+        self._stop_event = stop_event
+
+    def run(self):
+        ok = False
+        payload: object = None
+        try:
+            import image_key_extractor as ike  # lazy import
+
+            def _progress(msg: str) -> None:
+                try:
+                    if getattr(self._emitter, "progress", None):
+                        self._emitter.progress.emit(str(msg))
+                except Exception:
+                    pass
+
+            aes, xor = ike.extract_image_keys(
+                self._db_dir,
+                process_name=self._process_name,
+                stop_check=self._stop_event.is_set,
+                progress=_progress,
+            )
+            ok = True
+            payload = {"aes_key": aes, "xor_key": xor}
+        except Exception as e:
+            ok = False
+            payload = str(e)
+        try:
+            if getattr(self._emitter, "done", None):
+                self._emitter.done.emit(bool(ok), payload)
         except Exception:
             pass
 
@@ -471,6 +523,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         control_l.addWidget(quick_group)
 
+        # Image keys (V2) wizard entry for non-technical users
+        img_group = QtWidgets.QGroupBox("图片解密（可选）")
+        img_l = QtWidgets.QHBoxLayout(img_group)
+        img_l.setContentsMargins(12, 10, 12, 10)
+        img_l.setSpacing(10)
+
+        self._img_key_status = QtWidgets.QLabel("")
+        self._img_key_status.setWordWrap(True)
+        img_l.addWidget(self._img_key_status, 1)
+
+        self._btn_img_keys = QtWidgets.QPushButton("图片密钥…")
+        self._btn_img_keys.clicked.connect(self.open_image_key_wizard)
+        self._btn_img_clear = QtWidgets.QPushButton("清除")
+        self._btn_img_clear.clicked.connect(self.clear_image_keys)
+        img_l.addWidget(self._btn_img_keys)
+        img_l.addWidget(self._btn_img_clear)
+
+        control_l.addWidget(img_group)
+
         # Quick tools (no long text; actions only)
         tools = QtWidgets.QWidget()
         tools_l = QtWidgets.QHBoxLayout(tools)
@@ -702,6 +773,8 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._image_xor_key.setText(str(xor_val or "").strip())
 
+        self._refresh_image_key_status(cfg)
+
         suggested_self = _suggest_self_username_from_db_dir(cfg.get("db_dir", "") or "")
         if suggested_self:
             self._self_username_override.setPlaceholderText(f"留空=自动识别（例如：{suggested_self}）")
@@ -724,6 +797,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._base_url = f"http://{url_host}:{port}"
 
         self._refresh_quick_cards()
+
+    def _refresh_image_key_status(self, cfg: dict | None = None) -> None:
+        cfg = cfg or self._cfg or {}
+        aes = (cfg.get("image_aes_key") or "").strip()
+        xor_val = cfg.get("image_xor_key", "")
+
+        xor_text = ""
+        if isinstance(xor_val, int):
+            xor_text = f"0x{xor_val:02X}"
+        elif isinstance(xor_val, str) and xor_val.strip():
+            xor_text = xor_val.strip()
+
+        if aes:
+            masked = aes if len(aes) <= 8 else (aes[:4] + "…" + aes[-4:])
+            if xor_text:
+                self._img_key_status.setText(f"已配置（AES={masked}, XOR={xor_text}）")
+            else:
+                self._img_key_status.setText(f"已配置（AES={masked}）")
+        else:
+            self._img_key_status.setText("未配置：若需要在调试页/接口中解析图片，请点“图片密钥…”")
+
+    def set_image_keys(self, aes_key: str, xor_key: int | None) -> None:
+        aes_key = (aes_key or "").strip()
+        if not aes_key:
+            return
+
+        cfg = read_config_file(self._config_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg["image_aes_key"] = aes_key
+        if xor_key is not None:
+            try:
+                xv = int(xor_key)
+                if 0 <= xv <= 255:
+                    cfg["image_xor_key"] = xv
+            except Exception:
+                pass
+        try:
+            write_config_file(cfg, self._config_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "保存失败", str(e))
+            return
+        self._append_log("[gui] 已保存图片密钥")
+        self._refresh_ui_from_config()
+
+    def clear_image_keys(self) -> None:
+        cfg = read_config_file(self._config_path)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if "image_aes_key" not in cfg and "image_xor_key" not in cfg:
+            return
+        cfg.pop("image_aes_key", None)
+        cfg.pop("image_xor_key", None)
+        try:
+            write_config_file(cfg, self._config_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "保存失败", str(e))
+            return
+        self._append_log("[gui] 已清除图片密钥")
+        self._refresh_ui_from_config()
+
+    def open_image_key_wizard(self) -> None:
+        dlg = ImageKeyWizard(self)
+        dlg.exec()
 
     def _set_badge(self, label: QtWidgets.QLabel, *, state: str, text: str) -> None:
         label.setText(text or "")
@@ -1318,3 +1455,192 @@ def main(argv: list[str] | None = None) -> int:
     win = MainWindow(auto_start_service=auto)
     win.show()
     return int(app.exec())
+
+
+class ImageKeyWizard(QtWidgets.QDialog):
+    def __init__(self, parent: MainWindow):
+        super().__init__(parent)
+        self._mw = parent
+        self.setWindowTitle("图片密钥（V2）")
+        self.setModal(True)
+        self.resize(720, 420)
+
+        self._stop_event = threading.Event()
+        self._running = False
+
+        self._emitter = _ImageKeyEmitter()
+        try:
+            self._emitter.progress.connect(self._on_progress)  # type: ignore[union-attr]
+            self._emitter.done.connect(self._on_done)  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        tabs = QtWidgets.QTabWidget()
+        root.addWidget(tabs, 1)
+
+        # ---- Tab: Auto extract ----
+        tab_auto = QtWidgets.QWidget()
+        tabs.addTab(tab_auto, "自动提取（推荐）")
+        auto_l = QtWidgets.QVBoxLayout(tab_auto)
+        auto_l.setSpacing(10)
+
+        hint = QtWidgets.QLabel("步骤：在微信里点开 2-3 张图片（大图）→ 回到这里点“开始扫描”。")
+        hint.setWordWrap(True)
+        auto_l.addWidget(hint)
+
+        self._chk_ready = QtWidgets.QCheckBox("我已在微信打开图片（大图）")
+        auto_l.addWidget(self._chk_ready)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_start = QtWidgets.QPushButton("开始扫描")
+        self._btn_start.clicked.connect(self._start_scan)
+        self._btn_cancel = QtWidgets.QPushButton("取消")
+        self._btn_cancel.clicked.connect(self._cancel)
+        btn_row.addWidget(self._btn_start)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._btn_cancel)
+        auto_l.addLayout(btn_row)
+
+        self._status = QtWidgets.QLabel("")
+        self._status.setWordWrap(True)
+        auto_l.addWidget(self._status)
+
+        self._bar = QtWidgets.QProgressBar()
+        self._bar.setRange(0, 0)
+        self._bar.setVisible(False)
+        auto_l.addWidget(self._bar)
+        auto_l.addStretch(1)
+
+        # ---- Tab: Manual input ----
+        tab_manual = QtWidgets.QWidget()
+        tabs.addTab(tab_manual, "手动填写")
+        man_l = QtWidgets.QGridLayout(tab_manual)
+        man_l.setHorizontalSpacing(10)
+        man_l.setVerticalSpacing(10)
+
+        self._aes_in = QtWidgets.QLineEdit()
+        self._aes_in.setPlaceholderText("例如：56e5acd3dd609b2a")
+        self._xor_in = QtWidgets.QLineEdit()
+        self._xor_in.setPlaceholderText("例如：0xA2")
+
+        cfg = load_config_soft(self._mw._config_path)
+        self._aes_in.setText((cfg.get("image_aes_key") or "").strip())
+        xv = cfg.get("image_xor_key", "")
+        if isinstance(xv, int):
+            self._xor_in.setText(f"0x{xv:02X}")
+        else:
+            self._xor_in.setText(str(xv or "").strip())
+
+        self._btn_save_manual = QtWidgets.QPushButton("保存")
+        self._btn_save_manual.clicked.connect(self._save_manual)
+
+        row = 0
+        man_l.addWidget(QtWidgets.QLabel("AES key"), row, 0)
+        man_l.addWidget(self._aes_in, row, 1, 1, 2)
+        row += 1
+        man_l.addWidget(QtWidgets.QLabel("XOR key"), row, 0)
+        man_l.addWidget(self._xor_in, row, 1)
+        man_l.addWidget(self._btn_save_manual, row, 2)
+
+    def closeEvent(self, event):  # noqa: N802
+        try:
+            self._stop_event.set()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _set_running(self, running: bool) -> None:
+        self._running = bool(running)
+        self._btn_start.setEnabled((not self._running) and bool(self._chk_ready.isChecked()))
+        self._chk_ready.setEnabled(not self._running)
+        self._btn_cancel.setText("取消" if self._running else "关闭")
+        self._bar.setVisible(self._running)
+
+    def _start_scan(self):
+        if self._running:
+            return
+        if not self._chk_ready.isChecked():
+            QtWidgets.QMessageBox.information(self, "提示", "请先在微信里点开 2-3 张图片（大图）。")
+            return
+
+        cfg = load_config_soft(self._mw._config_path)
+        db_dir = (cfg.get("db_dir") or "").strip()
+        if not db_dir or not os.path.isdir(db_dir):
+            QtWidgets.QMessageBox.warning(self, "配置不完整", "db_dir 无效，请先在主界面选择微信 db_storage 目录。")
+            return
+
+        proc = (cfg.get("wechat_process") or "Weixin.exe").strip() or "Weixin.exe"
+
+        self._stop_event.clear()
+        self._status.setText("准备扫描…")
+        self._set_running(True)
+        try:
+            QtCore.QThreadPool.globalInstance().start(
+                _ImageKeyWorker(self._emitter, db_dir=db_dir, process_name=proc, stop_event=self._stop_event)
+            )
+        except Exception as e:
+            self._set_running(False)
+            QtWidgets.QMessageBox.critical(self, "失败", str(e))
+
+    def _cancel(self):
+        if self._running:
+            try:
+                self._stop_event.set()
+            except Exception:
+                pass
+            self._status.setText("正在取消…")
+            return
+        self.reject()
+
+    def _on_progress(self, msg: str):
+        self._status.setText(str(msg))
+
+    def _on_done(self, ok: bool, payload):
+        self._set_running(False)
+        if not ok:
+            msg = str(payload or "失败")
+            self._status.setText(msg)
+            QtWidgets.QMessageBox.warning(self, "未成功", msg)
+            return
+
+        aes = ""
+        xor = None
+        try:
+            if isinstance(payload, dict):
+                aes = str(payload.get("aes_key") or "").strip()
+                xor = payload.get("xor_key", None)
+        except Exception:
+            aes = ""
+            xor = None
+
+        if not aes:
+            QtWidgets.QMessageBox.warning(self, "未成功", "未提取到 AES key。请先点开几张图片（大图）后重试。")
+            return
+
+        self._mw.set_image_keys(aes, int(xor) if isinstance(xor, int) else None)
+        QtWidgets.QMessageBox.information(self, "完成", "已保存图片密钥到配置。现在可以尝试打开调试页查看图片。")
+        self.accept()
+
+    def _save_manual(self):
+        aes = (self._aes_in.text() or "").strip()
+        if not aes:
+            QtWidgets.QMessageBox.warning(self, "提示", "AES key 不能为空。")
+            return
+        xor_text = (self._xor_in.text() or "").strip()
+        xor_val: int | None = None
+        if xor_text:
+            try:
+                xv = int(xor_text, 16) if xor_text.lower().startswith("0x") else int(xor_text, 10)
+                if xv < 0 or xv > 255:
+                    raise ValueError("out of range")
+                xor_val = int(xv)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "提示", "XOR key 必须是 0-255 的数字（支持 0xA2）。")
+                return
+        self._mw.set_image_keys(aes, xor_val)
+        QtWidgets.QMessageBox.information(self, "完成", "已保存。")
+        self.accept()
