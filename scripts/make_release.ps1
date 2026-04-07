@@ -1,18 +1,20 @@
-$ErrorActionPreference = "Stop"
-
 param(
   [string]$Name = "",
   [string]$OutDir = "release"
 )
 
+$ErrorActionPreference = "Stop"
+
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-function _TryGit([string[]]$Args) {
+function _TryGit([string[]]$GitArgs) {
   try {
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (!$git) { return "" }
-    $out = & git @Args 2>$null
+    & git @("rev-parse", "--is-inside-work-tree") 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { return "" }
+    $out = & git @GitArgs 2>$null
     if ($LASTEXITCODE -ne 0) { return "" }
     return ($out | Out-String).Trim()
   } catch {
@@ -74,7 +76,15 @@ Notes:
 $quick | Out-File -Encoding UTF8 (Join-Path $stageDir "QUICKSTART.txt")
 
 Write-Host "[3/3] Create ZIP + SHA256..." -ForegroundColor Cyan
-Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force
+for ($i = 1; $i -le 8; $i++) {
+  try {
+    Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force
+    break
+  } catch {
+    if ($i -ge 8) { throw }
+    Start-Sleep -Milliseconds (500 * $i)
+  }
+}
 $hash = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
 ("{0}  {1}" -f $hash, (Split-Path -Leaf $zipPath)) | Out-File -Encoding ASCII -FilePath $shaPath
 
@@ -82,4 +92,3 @@ Write-Host ""
 Write-Host "Release dir: $stageDir"
 Write-Host "Release zip: $zipPath"
 Write-Host "SHA256:      $shaPath"
-
