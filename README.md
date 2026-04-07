@@ -1,6 +1,54 @@
-# WeChat 4.x Database Decryptor
+# WeChat Data Service / WeChat 4.x Database Decryptor
 
-微信 4.0 (Windows、MacOS、Linux) 本地数据库解密工具。从运行中的微信进程内存提取加密密钥，解密所有 SQLCipher 4 加密数据库，并提供实时消息监听。
+本项目是一个**本地离线的数据服务**：从运行中的微信进程内存提取 SQLCipher 4 密钥，解密并解析微信本地数据库（联系人/会话/消息/头像等），并通过本机 HTTP API 提供给其它应用调用；同时提供 Windows GUI 启动器，方便普通用户配置、启动、开机自启与排障。
+
+定位（很重要）：
+- ✅ 做：**数据读取/解密/解析 + HTTP API + GUI 管理 + 画像/记忆/AI 运行记录的存取**
+- ❌ 不做：AI 推理（由上层应用完成）、发送微信消息（自动回复属于上层应用能力）
+
+适用场景：
+- 微信消息自动回复程序（读消息 + 去重/ACK + 联系人检索 + 群成员映射）
+- 个性化服务（取历史对话 → 上层生成策略/画像/记忆 → 写回本服务）
+- 人物画像/记忆管理器（展示/编辑/待确认 pending）
+
+相关文档：
+- API：`docs/API.md`
+- 集成缺口/易踩坑：`docs/INTEGRATION_GAPS.md`
+- 画像/记忆模型建议：`docs/PERSONA_MEMORY_MODEL.md`
+- 上层应用规划：`docs/UPPER_LAYER_APPS.md`
+- Windows 分发建议：`docs/DISTRIBUTION_WINDOWS.md`
+
+---
+
+## 普通用户（Windows）快速开始
+
+1) 从 GitHub Releases 下载 `WeChatDataService_Windows_*.zip` 并解压  
+2) 保持微信运行且已登录  
+3) 首次运行建议 **右键 → 以管理员身份运行** `GUI\\WeChatDataServiceGUI.exe`（需要读取微信进程内存提取密钥）  
+4) 在 GUI 中点击“启动服务”  
+5) 验证服务：打开 `http://127.0.0.1:5678/api/v1/health`（返回 `{"ok":true,...}` 即正常）
+
+配置/日志位置（安装版默认）：
+- 配置：`%APPDATA%\\WeChatDataService\\config.json`
+- 日志：`%APPDATA%\\WeChatDataService\\logs\\service.log`
+
+便携版（解压即用）：
+- 若 exe 同目录存在 `config.json`，或设置 `WECHAT_DECRYPT_PORTABLE=1`，则数据会写在 exe 同目录（包含 `logs/`）。
+
+## 常见问题（Windows）
+
+- **密钥提取失败/无权限**：请先确认微信正在运行并已登录；首次运行尽量“以管理员身份运行”。
+- **`db_dir` 找不到/不正确**：微信设置 → 文件管理 → 打开文件夹，通常能定位到 `...\\db_storage`。
+- **GUI 启动报 QtCore DLL 错误**：优先使用 GitHub Release 的打包版；自行构建请用 `scripts\\build_windows.ps1`（会清理常见的 `icu*.dll` 冲突）。
+- **想让其它设备访问**：需要把 `listen_host` 改为 `0.0.0.0` 并配置防火墙/内网隔离（强隐私风险，见上文安全提示）。
+
+---
+
+## 安全提示（非常重要）
+
+- 默认只监听 `127.0.0.1`，这是为了避免把隐私数据暴露到局域网。
+- 如果你把 `listen_host` 改成 `0.0.0.0`（允许外部访问），你会暴露**联系人/消息/头像**等敏感信息：请仅在你明确理解风险时启用，并配合防火墙/内网隔离使用。
+- `api_token` 目前用于**写接口**鉴权；读接口在暴露到外网时仍有隐私风险。
 
 ## 更新日志
 
@@ -23,7 +71,7 @@
 
 WCDB (微信的 SQLCipher 封装) 会在进程内存中缓存派生后的 raw key，格式为 `x'<64hex_enc_key><32hex_salt>'`。三个平台（Windows / Linux / macOS）均可通过扫描进程内存匹配此模式，再通过 HMAC 校验 page 1 确认密钥正确性。
 
-## 使用方法
+## 开发者使用方法
 
 ### 环境要求
 
@@ -117,6 +165,22 @@ Linux 版 `config.json` 示例：
 - 上层应用清单与功能规划：`docs/UPPER_LAYER_APPS.md`
 - Windows 分发建议：`docs/DISTRIBUTION_WINDOWS.md`
 - 打包 Release（便携版 zip）：`powershell -ExecutionPolicy Bypass -File scripts\\make_release.ps1`
+
+## 构建与发布（给维护者）
+
+本仓库提供了 Windows 的一键构建脚本：
+
+- 构建 onedir：`powershell -ExecutionPolicy Bypass -File scripts\\build_windows.ps1`
+- 生成便携版 release（zip + sha256）：`powershell -ExecutionPolicy Bypass -File scripts\\make_release.ps1`
+- 生成安装器（需要 Inno Setup 6 / ISCC.exe）：`powershell -ExecutionPolicy Bypass -File scripts\\build_installer.ps1`
+- 注意：GUI 依赖 `PyQt6`（GPL/商业许可），产品分发前请确认合规。
+
+GitHub Actions：
+- push/PR 自动跑测试：`.github/workflows/ci.yml`
+- 推送 tag `v*` 自动构建并发布 GitHub Release：`.github/workflows/release.yml`
+  - 示例：
+    - `git tag -a v20260407.1 -m "release"`
+    - `git push origin v20260407.1`
 
 ### MCP Server (Claude AI 集成)
 
