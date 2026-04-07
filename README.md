@@ -116,6 +116,7 @@ Linux 版 `config.json` 示例：
 - 人物画像/记忆数据模型建议：`docs/PERSONA_MEMORY_MODEL.md`
 - 上层应用清单与功能规划：`docs/UPPER_LAYER_APPS.md`
 - Windows 分发建议：`docs/DISTRIBUTION_WINDOWS.md`
+- 打包 Release（便携版 zip）：`powershell -ExecutionPolicy Bypass -File scripts\\make_release.ps1`
 
 ### MCP Server (Claude AI 集成)
 

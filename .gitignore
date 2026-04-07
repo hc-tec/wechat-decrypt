@@ -23,6 +23,9 @@ run_hook.bat
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv*/
 build/
 dist/
@@ -31,6 +34,10 @@ build_*/
 dist_*/
 release/
 *.spec
+
+# IDE
+.vscode/
+.idea/
 
 # OS
 .DS_Store

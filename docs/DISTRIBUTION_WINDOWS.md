@@ -9,6 +9,13 @@
   - `WeChatDataServiceGUI/WeChatDataServiceGUI.exe`（GUI 启动器，普通用户推荐用它）
 - 进一步封装：用 Inno Setup / NSIS 做 `Setup.exe`，安装到用户目录并创建桌面快捷方式
 
+## 构建 Release（给 GitHub Release 用）
+
+- 生成“便携版 zip”（推荐先用这个上 GitHub Release）：
+  - `powershell -ExecutionPolicy Bypass -File scripts\\make_release.ps1`
+- 生成安装器（需要先安装 Inno Setup 6）：
+  - `powershell -ExecutionPolicy Bypass -File scripts\\build_installer.ps1`
+
 说明：
 - **安装版默认**：配置/日志/解密产物放在用户目录：`%APPDATA%\\WeChatDataService\\`（避免 Program Files 权限与更新覆盖）。
 - **便携版（解压即用）**：若 exe 同目录存在 `config.json`，或设置环境变量 `WECHAT_DECRYPT_PORTABLE=1`，则继续使用 exe 同目录存放数据。
