@@ -1,10 +1,19 @@
 # WeChat Data Service API（本地离线 / Windows）
 
-默认监听地址：`http://127.0.0.1:5678`
+## 接入地址
+
+- 默认基址：`http://127.0.0.1:5678`
+- 实际基址：以 `config.json` 或 GUI 中的 `listen_host`、`listen_port` 为准
+- 推荐做法：上层应用启动时先读自己的服务配置，或先请求一次 `GET /api/v1/health` / `GET /api/v1/state` 做探活
+- 不建议写死非本机 IP；本项目的默认部署方式是**本机回环地址 + 本地端口**
+- 注意区分“服务绑定地址”和“客户端访问地址”：
+- 若服务绑定的是 `0.0.0.0:5678`，表示监听所有网卡；本机应用仍应优先访问 `http://127.0.0.1:5678` 或 `http://localhost:5678`
+- `0.0.0.0` 是监听用地址，不应作为上层应用的请求目标地址写死进客户端代码
 
 说明：
 - 本服务只读微信本地数据库并解密/解析，**不提供 AI**。
-- 适配上层应用：自动回复、个性化对话取数、人物画像/记忆（后续可扩展写接口）。
+- 适配上层应用：自动回复、个性化对话取数、人物画像/记忆。
+- 所有接口路径均相对于上述基址，例如：`http://127.0.0.1:5678/api/v1/health`
 
 鉴权（可选）：
 - `config.json` 设置 `api_token` 后，**所有写接口**需要带 `Authorization: Bearer <token>`（或 `X-Api-Token: <token>`）。
@@ -37,7 +46,7 @@
 
 响应示例：
 ```json
-{"items":[{"username":"wxid_xxx","nick_name":"张三","remark":"同事","display_name":"同事","is_group":false,"avatar_url":"/avatar/wxid_xxx"}]}
+{"items":[{"username":"wxid_xxx","alias":"zhangsan01","nick_name":"张三","remark":"同事","display_name":"同事","is_group":false,"avatar_url":"/avatar/wxid_xxx"}]}
 ```
 
 ### `GET /api/v1/recent_contacts?limit=20&offset=0`
@@ -69,6 +78,20 @@
 响应示例：
 ```json
 {"items":[{"username":"wxid_xxx","display_name":"同事","avatar_url":"/avatar/wxid_xxx","unread":0,"last_timestamp":1710000000,"last_msg_type":1,"summary":"晚上吃啥"}]}
+```
+
+### `GET /api/v1/chats/{username}/members`
+
+群成员列表（仅群聊可用），返回群名、群公告、群主、成员备注/昵称/头像。
+
+说明：
+- `username` 必须是群 id（如 `123456@chatroom`）
+- 成员 `display_name` 规则：`remark > nick_name > username`
+- 少量未出现在 `contact`/`stranger` 表里的成员，会尝试从 `chat_room.ext_buffer` 里补出 `username`
+
+响应示例：
+```json
+{"username":"123456@chatroom","display_name":"测试群","owner_username":"wxid_owner","owner_display_name":"群主","member_count":2,"resolved_member_count":2,"items":[{"member_id":11,"username":"wxid_alice","alias":"alice01","nick_name":"Alice","remark":"同事A","display_name":"同事A","is_owner":false,"is_self":false,"avatar_url":"/avatar/wxid_alice"}]}
 ```
 
 ### `GET /avatar/{username}`

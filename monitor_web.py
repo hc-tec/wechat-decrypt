@@ -6,7 +6,7 @@ http://localhost:5678
 - 检测到变化后：全量解密DB + 全量WAL patch
 - SSE 服务器推送
 """
-import hashlib, struct, os, sys, json, time, sqlite3, io, threading, queue, traceback
+import hashlib, struct, os, sys, json, time, sqlite3, io, threading, queue, traceback, re
 import hmac as hmac_mod
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -20,7 +20,7 @@ from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_f
 from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, strip_key_metadata
 from persona_store import PersonaStore
-from chat_history import query_chat_history
+from chat_history import parse_group_sender_content, query_chat_history
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -78,6 +78,8 @@ _detail_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='detail'
 # ---- Emoji 缓存 (md5 → {cdn_url, aes_key, encrypt_url}) ----
 _emoji_lookup = {}       # md5 → dict
 _emoji_lookup_lock = threading.Lock()
+
+_ASCII_TOKEN_RE = re.compile(r"[0-9A-Za-z_@.\-]{6,128}")
 
 _emoji_keys_dict = None  # 保存 keys 引用供刷新用
 _emoji_last_refresh = 0
@@ -470,10 +472,31 @@ def decrypt_wal_full(wal_path, out_path, enc_key):
     return patched, ms
 
 
+def resolve_contact_db_path(db_cache=None, keys=None):
+    db_path = None
+    rel_key = os.path.join("contact", "contact.db")
+
+    try:
+        if db_cache:
+            db_path = db_cache.get(rel_key)
+    except Exception:
+        db_path = None
+
+    if not db_path and os.path.exists(CONTACT_CACHE):
+        db_path = CONTACT_CACHE
+
+    if db_path and os.path.exists(db_path):
+        return db_path
+    return None
+
+
 def load_contact_names():
     names = {}
     try:
-        conn = sqlite3.connect(CONTACT_CACHE)
+        db_path = resolve_contact_db_path()
+        if not db_path:
+            return names
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
             names[r[0]] = r[2] if r[2] else r[1] if r[1] else r[0]
         conn.close()
@@ -491,30 +514,20 @@ def load_contacts(db_cache=None, keys=None):
     names = {}
     full = []
 
-    db_path = None
-    try:
-        rel_key = os.path.join("contact", "contact.db")
-        if db_cache and keys and get_key_info(keys, rel_key):
-            db_path = db_cache.get(rel_key)
-    except Exception:
-        db_path = None
-
-    # fallback：如果用户曾运行 decrypt_db.py，直接读已解密的副本
-    if not db_path and os.path.exists(CONTACT_CACHE):
-        db_path = CONTACT_CACHE
-
-    if not db_path or not os.path.exists(db_path):
+    db_path = resolve_contact_db_path(db_cache, keys)
+    if not db_path:
         return names, full
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = conn.execute("SELECT username, nick_name, remark FROM contact").fetchall()
+        rows = conn.execute("SELECT username, alias, nick_name, remark FROM contact").fetchall()
         conn.close()
-        for username, nick_name, remark in rows:
+        for username, alias, nick_name, remark in rows:
             display = remark if remark else nick_name if nick_name else username
             names[username] = display
             full.append({
                 "username": username,
+                "alias": alias or "",
                 "nick_name": nick_name or "",
                 "remark": remark or "",
                 "display_name": display,
@@ -524,6 +537,190 @@ def load_contacts(db_cache=None, keys=None):
         return {}, []
 
     return names, full
+
+
+def _looks_like_wechat_username(token: str) -> bool:
+    token = (token or "").strip()
+    if not token or token.endswith("@chatroom"):
+        return False
+    if token.startswith("wxid_"):
+        return True
+    if token.endswith("@openim"):
+        return bool(re.fullmatch(r"[0-9A-Za-z._-]{4,96}@openim", token))
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{4,63}", token))
+
+
+def extract_chatroom_member_usernames(ext_buffer) -> list[str]:
+    if isinstance(ext_buffer, memoryview):
+        ext_buffer = ext_buffer.tobytes()
+    if not isinstance(ext_buffer, (bytes, bytearray)) or not ext_buffer:
+        return []
+
+    text = ''.join(chr(b) if 32 <= b < 127 else ' ' for b in ext_buffer)
+    seen = set()
+    usernames = []
+    for token in _ASCII_TOKEN_RE.findall(text):
+        token = token.strip("._-")
+        if not _looks_like_wechat_username(token):
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        usernames.append(token)
+    return usernames
+
+
+def query_group_members(contact_db_path: str, group_username: str, contact_names=None, self_username: str = ""):
+    if "@chatroom" not in (group_username or ""):
+        raise ValueError("members only available for group chats")
+    if not contact_db_path or not os.path.exists(contact_db_path):
+        raise FileNotFoundError("contact cache not ready")
+
+    names = contact_names or {}
+    conn = sqlite3.connect(f"file:{contact_db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        group_row = conn.execute(
+            """
+            SELECT
+                cr.id AS room_id,
+                cr.username AS username,
+                cr.owner AS owner_username,
+                cr.ext_buffer AS ext_buffer,
+                cd.announcement_ AS announcement,
+                cd.announcement_editor_ AS announcement_editor_username,
+                cd.announcement_publish_time_ AS announcement_publish_time,
+                c.alias AS alias,
+                c.nick_name AS nick_name,
+                c.remark AS remark
+            FROM chat_room cr
+            LEFT JOIN chat_room_info_detail cd ON cd.room_id_ = cr.id
+            LEFT JOIN contact c ON c.username = cr.username
+            WHERE cr.username = ?
+            LIMIT 1
+            """,
+            (group_username,),
+        ).fetchone()
+
+        if group_row:
+            group = dict(group_row)
+        else:
+            fallback = conn.execute(
+                "SELECT username, alias, nick_name, remark FROM contact WHERE username=? LIMIT 1",
+                (group_username,),
+            ).fetchone()
+            if not fallback:
+                return None
+            group = {
+                "room_id": None,
+                "username": fallback["username"],
+                "owner_username": "",
+                "ext_buffer": b"",
+                "announcement": "",
+                "announcement_editor_username": "",
+                "announcement_publish_time": 0,
+                "alias": fallback["alias"],
+                "nick_name": fallback["nick_name"],
+                "remark": fallback["remark"],
+            }
+
+        group_display_name = (
+            (group.get("remark") or "").strip()
+            or (group.get("nick_name") or "").strip()
+            or names.get(group_username, group_username)
+        )
+        owner_username = (group.get("owner_username") or "").strip()
+        announcement_editor_username = (group.get("announcement_editor_username") or "").strip()
+
+        items = []
+        seen_usernames = set()
+        member_rows = []
+        if group.get("room_id") is not None:
+            member_rows = conn.execute(
+                """
+                SELECT
+                    cm.member_id AS member_id,
+                    COALESCE(c.username, s.username, '') AS username,
+                    COALESCE(c.alias, s.alias, '') AS alias,
+                    COALESCE(c.nick_name, s.nick_name, '') AS nick_name,
+                    COALESCE(c.remark, s.remark, '') AS remark
+                FROM chatroom_member cm
+                LEFT JOIN contact c ON c.id = cm.member_id
+                LEFT JOIN stranger s ON s.id = cm.member_id
+                WHERE cm.room_id = ?
+                ORDER BY cm.member_id ASC
+                """,
+                (group["room_id"],),
+            ).fetchall()
+
+        resolved_rows = 0
+        for row in member_rows:
+            username = (row["username"] or "").strip()
+            if not username or username in seen_usernames:
+                continue
+            resolved_rows += 1
+            seen_usernames.add(username)
+            remark = (row["remark"] or "").strip()
+            nick_name = (row["nick_name"] or "").strip()
+            display_name = remark or nick_name or names.get(username, username)
+            items.append({
+                "member_id": int(row["member_id"] or 0),
+                "username": username,
+                "alias": (row["alias"] or "").strip(),
+                "nick_name": nick_name,
+                "remark": remark,
+                "display_name": display_name,
+                "is_owner": bool(owner_username and username == owner_username),
+                "is_self": bool(self_username and username == self_username),
+                "avatar_url": f"/avatar/{urllib.parse.quote(username, safe='')}",
+            })
+
+        unresolved_slots = max(len(member_rows) - resolved_rows, 0)
+        if unresolved_slots:
+            for username in extract_chatroom_member_usernames(group.get("ext_buffer")):
+                if unresolved_slots <= 0:
+                    break
+                if username in seen_usernames:
+                    continue
+                seen_usernames.add(username)
+                items.append({
+                    "member_id": 0,
+                    "username": username,
+                    "alias": "",
+                    "nick_name": "",
+                    "remark": "",
+                    "display_name": names.get(username, username),
+                    "is_owner": bool(owner_username and username == owner_username),
+                    "is_self": bool(self_username and username == self_username),
+                    "avatar_url": f"/avatar/{urllib.parse.quote(username, safe='')}",
+                })
+                unresolved_slots -= 1
+
+        payload = {
+            "username": group_username,
+            "alias": (group.get("alias") or "").strip(),
+            "nick_name": (group.get("nick_name") or "").strip(),
+            "remark": (group.get("remark") or "").strip(),
+            "display_name": group_display_name,
+            "is_group": True,
+            "avatar_url": f"/avatar/{urllib.parse.quote(group_username, safe='')}",
+            "owner_username": owner_username,
+            "owner_display_name": names.get(owner_username, owner_username) if owner_username else "",
+            "announcement": (group.get("announcement") or "").strip(),
+            "announcement_editor_username": announcement_editor_username,
+            "announcement_editor_display_name": (
+                names.get(announcement_editor_username, announcement_editor_username)
+                if announcement_editor_username else ""
+            ),
+            "announcement_publish_time": int(group.get("announcement_publish_time") or 0),
+            "member_count": len(member_rows) if member_rows else len(items),
+            "resolved_member_count": len(items),
+            "unresolved_member_count": max((len(member_rows) if member_rows else len(items)) - len(items), 0),
+            "items": items,
+        }
+        return payload
+    finally:
+        conn.close()
 
 
 def detect_self_username(cfg_value: str, wechat_base_dir: str, contact_names: dict, db_cache=None, keys=None) -> str:
@@ -1334,6 +1531,7 @@ class SessionMonitor:
 
                     local_id, local_type, create_time, real_sender_id, content, ct = row
                     raw = _decompress_message_content(content, ct)
+                    sender_from_content, clean_raw = parse_group_sender_content(raw, "@chatroom" in username)
 
                     sender_username = ""
                     try:
@@ -1352,10 +1550,10 @@ class SessionMonitor:
                         "local_type": local_type or 0,
                         "create_time": create_time or timestamp,
                         "real_sender_id": real_sender_id or 0,
-                        "sender_username": sender_username or "",
+                        "sender_username": sender_username or sender_from_content or "",
                         "base_type": int(base_type or 0),
                         "sub_type": sub_type,
-                        "raw": raw,
+                        "raw": clean_raw,
                     }
                 except Exception as e:
                     if 'malformed' in str(e) and _try == 0:
@@ -2340,6 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
                 def _hit(c):
                     return (
                         query in (c.get("username", "").lower())
+                        or query in (c.get("alias", "").lower())
                         or query in (c.get("nick_name", "").lower())
                         or query in (c.get("remark", "").lower())
                         or query in (c.get("display_name", "").lower())
@@ -2451,6 +2650,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     item = {
                         "username": uname,
+                        "alias": "",
                         "nick_name": "",
                         "remark": "",
                         "display_name": names.get(uname, uname),
@@ -2489,6 +2689,7 @@ class Handler(BaseHTTPRequestHandler):
                 full_map = {c.get("username"): c for c in full if c.get("username")}
                 base = full_map.get(username) or {
                     "username": username,
+                    "alias": "",
                     "nick_name": "",
                     "remark": "",
                     "display_name": names.get(username, username),
@@ -2671,6 +2872,59 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(200, {"username": username, **result})
+            return
+
+        elif path.startswith('/api/v1/chats/') and path.endswith('/members'):
+            parts = path.split('/')
+            if len(parts) != 6 or parts[5] != 'members':
+                self.send_error(404)
+                return
+
+            username = urllib.parse.unquote(parts[4] or "").strip()
+            if not username:
+                self.send_error(400, "missing username")
+                return
+            if "@chatroom" not in username:
+                self.send_error(400, "members only available for group chats")
+                return
+
+            db_cache = getattr(self.__class__, "db_cache", None)
+            names = getattr(self.__class__, "contact_names", {}) or {}
+            self_username = getattr(self.__class__, "self_username", "") or ""
+            contact_db_path = resolve_contact_db_path(db_cache)
+            if not contact_db_path:
+                self.send_error(503, "contact cache not ready")
+                return
+
+            try:
+                payload = query_group_members(
+                    contact_db_path,
+                    group_username=username,
+                    contact_names=names,
+                    self_username=self_username,
+                )
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except FileNotFoundError as e:
+                self.send_error(503, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"members failed: {e}")
+                return
+
+            if not payload:
+                self.send_error(404, "group not found")
+                return
+
+            store = getattr(self.__class__, "persona_store", None)
+            if store:
+                try:
+                    store.record_recent_contact(username)
+                except Exception:
+                    pass
+
+            self._send_json(200, payload)
             return
 
         elif path.startswith('/api/v1/chats/') and path.endswith('/history'):

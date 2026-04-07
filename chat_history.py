@@ -1,10 +1,12 @@
 import hashlib
+import re
 import sqlite3
 
 import zstandard as zstd
 
 
 _zstd_dctx = zstd.ZstdDecompressor()
+_GROUP_SENDER_PREFIX_RE = re.compile(r"^[0-9A-Za-z._-]+(?:@[0-9A-Za-z._-]+)?$")
 
 
 def format_msg_type(t: int) -> str:
@@ -48,6 +50,22 @@ def _decompress_message_content(content, ct_flag) -> str:
         return str(content)
     except Exception:
         return ""
+
+
+def parse_group_sender_content(content: str, is_group: bool) -> tuple[str, str]:
+    if not is_group:
+        return "", content or ""
+    text = content or ""
+    if ":\n" not in text:
+        return "", text
+
+    sender, body = text.split(":\n", 1)
+    sender = (sender or "").strip()
+    if not sender:
+        return "", text
+    if len(sender) > 128 or not _GROUP_SENDER_PREFIX_RE.fullmatch(sender):
+        return "", text
+    return sender, body
 
 
 def _load_name2id_map(conn: sqlite3.Connection) -> dict:
@@ -147,6 +165,7 @@ def query_chat_history(
 
             for local_id, local_type, create_time, real_sender_id, content, ct in rows:
                 raw = _decompress_message_content(content, ct)
+                sender_from_content, clean_raw = parse_group_sender_content(raw, is_group)
                 if local_type and local_type > 4294967296:
                     base_type = int(local_type % 4294967296)
                     sub_type = int(local_type >> 32)
@@ -154,11 +173,11 @@ def query_chat_history(
                     base_type = int(local_type or 0)
                     sub_type = 0
 
-                sender_username = id_map.get(int(real_sender_id or 0), "")
+                sender_username = id_map.get(int(real_sender_id or 0), "") or sender_from_content
                 sender_display = names.get(sender_username, sender_username) if sender_username else ""
 
                 if base_type == 1:
-                    text = raw
+                    text = clean_raw
                 else:
                     text = f"[{format_msg_type(base_type)}]"
 
@@ -184,7 +203,7 @@ def query_chat_history(
                     item["direction"] = ""
 
                 if include_raw:
-                    item["raw"] = raw
+                    item["raw"] = clean_raw
                 collected.append((int(create_time or 0), int(local_id or 0), item))
         except Exception as e:
             warnings.append(f"{db_path}: {e}")
@@ -214,4 +233,3 @@ def query_chat_history(
     if warnings:
         payload["warnings"] = warnings[:5]
     return payload
-
