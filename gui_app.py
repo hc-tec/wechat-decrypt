@@ -1527,9 +1527,9 @@ class ImageKeyWizard(QtWidgets.QDialog):
         man_l.setVerticalSpacing(10)
 
         self._aes_in = QtWidgets.QLineEdit()
-        self._aes_in.setPlaceholderText("例如：56e5acd3dd609b2a")
+        self._aes_in.setPlaceholderText("例如：0123456789abcdef")
         self._xor_in = QtWidgets.QLineEdit()
-        self._xor_in.setPlaceholderText("例如：0xA2")
+        self._xor_in.setPlaceholderText("例如：0x88")
 
         cfg = load_config_soft(self._mw._config_path)
         self._aes_in.setText((cfg.get("image_aes_key") or "").strip())
