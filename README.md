@@ -1,5 +1,8 @@
 # WeChat Data Service / WeChat 4.x Database Decryptor
 
+![CI](https://github.com/hc-tec/wechat-decrypt/actions/workflows/ci.yml/badge.svg)
+![Release](https://img.shields.io/github/v/release/hc-tec/wechat-decrypt?include_prereleases)
+
 本项目是一个**本地离线的数据服务**：从运行中的微信进程内存提取 SQLCipher 4 密钥，解密并解析微信本地数据库（联系人/会话/消息/头像等），并通过本机 HTTP API 提供给其它应用调用；同时提供 Windows GUI 启动器，方便普通用户配置、启动、开机自启与排障。
 
 定位（很重要）：
