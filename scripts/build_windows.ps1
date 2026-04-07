@@ -3,6 +3,16 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
+function Resolve-PythonCmd {
+  $py = Get-Command python -ErrorAction SilentlyContinue
+  if ($py) { return "python" }
+  $py = Get-Command py -ErrorAction SilentlyContinue
+  if ($py) { return "py" }
+  throw "python/py not found in PATH"
+}
+
+$PY = Resolve-PythonCmd
+
 # 避免上一次运行的 exe 占用 dist 内 DLL，导致 PyInstaller 清理失败
 try {
   Stop-Process -Name "WeChatDataServiceGUI","WeChatDataServiceGUIConsole","WeChatDataService" -Force -ErrorAction SilentlyContinue
@@ -11,7 +21,7 @@ try {
 }
 
 if (!(Test-Path ".venv-build")) {
-  py -m venv .venv-build
+  & $PY -m venv .venv-build
 }
 
 & .venv-build\Scripts\python -m pip install -U pip
