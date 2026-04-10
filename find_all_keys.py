@@ -18,8 +18,8 @@ def _load_impl():
     )
 
 
-def get_pids():
-    return _load_impl().get_pids()
+def get_pids(*args, **kwargs):
+    return _load_impl().get_pids(*args, **kwargs)
 
 
 def main():

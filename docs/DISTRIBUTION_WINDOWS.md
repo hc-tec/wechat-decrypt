@@ -37,5 +37,6 @@
 ## 自启动（可选）
 
 对普通用户友好做法：
-- 安装器里创建「开机启动」选项：用 Windows 任务计划程序（Task Scheduler）在登录后启动 `WeChatDataService.exe`
-- 或者把快捷方式放到启动文件夹：`shell:startup`
+- 安装器/GUI 的「开机自启」应启动 `WeChatDataServiceGUI.exe --autostart`，不要直接启动服务进程。
+- 自启 GUI 会先最小化到托盘，等待微信启动/登录；检测到微信进程且 `db_dir` 有效后再拉起服务。
+- 如果微信进程已启动但登录态或内存密钥尚未就绪，服务可能会早退；GUI 会在自启模式下延迟重试，避免用户开机后手动再点一次。

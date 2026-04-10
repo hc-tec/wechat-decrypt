@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import autostart
 import config
+import wechat_status
 
 
 class _FakeKey:
@@ -83,7 +84,21 @@ class ConfigAndAutostartTests(unittest.TestCase):
             autostart.delete_run_command("App")
             self.assertEqual(autostart.get_run_command("App"), "")
 
+    def test_wechat_process_candidates_prefer_configured_name(self):
+        with patch.object(wechat_status.platform, "system", return_value="Windows"):
+            names = wechat_status.candidate_process_names("CustomWeChat")
+        self.assertEqual(names[:3], ["CustomWeChat", "CustomWeChat.exe", "Weixin.exe"])
+        self.assertIn("WeChat.exe", names)
+        with patch.object(wechat_status.platform, "system", return_value="Windows"):
+            path_names = wechat_status.candidate_process_names(r"C:\Apps\Weixin.exe")
+        self.assertEqual(path_names[:2], ["Weixin.exe", "WeChat.exe"])
+
+    def test_windows_tasklist_contains_exact_image_name(self):
+        output = '"Weixin.exe","1234","Console","1","120,000 K"\n'
+        self.assertTrue(wechat_status._windows_tasklist_contains(output, "Weixin.exe"))
+        self.assertFalse(wechat_status._windows_tasklist_contains(output, "WeChat.exe"))
+        self.assertFalse(wechat_status._windows_tasklist_contains("INFO: No tasks are running\n", "Weixin.exe"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

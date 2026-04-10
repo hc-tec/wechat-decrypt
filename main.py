@@ -12,16 +12,12 @@ import functools
 print = functools.partial(print, flush=True)
 
 from key_utils import strip_key_metadata
+from wechat_status import is_wechat_running
 
 
-def check_wechat_running():
+def check_wechat_running(process_name=None):
     """检查微信是否在运行，返回 True/False"""
-    from find_all_keys import get_pids
-    try:
-        get_pids()
-        return True
-    except RuntimeError:
-        return False
+    return is_wechat_running(process_name)
 
 
 def ensure_keys(keys_file, db_dir):
@@ -90,7 +86,7 @@ def main():
     cfg = load_config()
 
     # 2. 检查微信进程
-    if not check_wechat_running():
+    if not check_wechat_running(cfg.get("wechat_process")):
         print(f"[!] 未检测到微信进程 ({cfg.get('wechat_process', 'WeChat')})")
         print("    请先启动微信并登录，然后重新运行")
         sys.exit(1)

@@ -14,6 +14,7 @@ print = functools.partial(print, flush=True)
 from key_scan_common import (
     collect_db_files, scan_memory_for_keys, cross_verify_keys, save_results,
 )
+from wechat_status import candidate_process_names
 
 kernel32 = ctypes.windll.kernel32
 MEM_COMMIT = 0x1000
@@ -29,25 +30,32 @@ class MBI(ctypes.Structure):
     ]
 
 
-def get_pids():
-    """返回所有 Weixin.exe 进程的 (pid, mem_kb) 列表，按内存降序"""
+def get_pids(process_name=None):
+    """返回所有候选微信进程的 (pid, mem_kb) 列表，按内存降序"""
     import subprocess
-    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-                       capture_output=True, text=True)
+
     pids = []
-    for line in r.stdout.strip().split('\n'):
-        if not line.strip():
-            continue
-        p = line.strip('"').split('","')
-        if len(p) >= 5:
-            pid = int(p[1])
-            mem = int(p[4].replace(',', '').replace(' K', '').strip() or '0')
-            pids.append((pid, mem))
+    seen = set()
+    for image_name in candidate_process_names(process_name):
+        r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True)
+        for line in r.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            p = line.strip('"').split('","')
+            if len(p) >= 5:
+                pid = int(p[1])
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                mem = int(p[4].replace(',', '').replace(' K', '').strip() or '0')
+                pids.append((pid, mem))
     if not pids:
-        raise RuntimeError("Weixin.exe 未运行")
+        names = "/".join(candidate_process_names(process_name))
+        raise RuntimeError(f"{names} 未运行")
     pids.sort(key=lambda x: x[1], reverse=True)
     for pid, mem in pids:
-        print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
+        print(f"[+] WeChat PID={pid} ({mem // 1024}MB)")
     return pids
 
 
@@ -93,7 +101,7 @@ def main():
         print(f"  salt {salt_hex}: {', '.join(dbs)}")
 
     # 2. 打开所有微信进程
-    pids = get_pids()
+    pids = get_pids(_cfg.get("wechat_process"))
 
     hex_re = re.compile(b"x'([0-9a-fA-F]{64,192})'")
     key_map = {}

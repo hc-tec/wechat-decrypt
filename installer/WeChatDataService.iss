@@ -26,7 +26,7 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面图标"; GroupDescription: "附加任务:"; Flags: unchecked
-Name: "autostart"; Description: "开机自启（登录后后台运行）"; GroupDescription: "附加任务:"; Flags: unchecked
+Name: "autostart"; Description: "开机自启（等待微信启动/登录后后台运行）"; GroupDescription: "附加任务:"; Flags: unchecked
 
 [Files]
 Source: "..\dist\WeChatDataService\*"; DestDir: "{app}\Service"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -41,4 +41,3 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\GUI\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
-

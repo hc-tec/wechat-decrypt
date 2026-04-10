@@ -9,10 +9,14 @@ from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
 from log_utils import get_current_log_dir, get_current_log_path, init_app_logging, write_log_line
 from qt_compat import QT_LIB, QtCore, QtGui, QtWidgets
+from wechat_status import is_wechat_running
 
 
 APP_TITLE = "WeChat Data Service"
 AUTOSTART_VALUE_NAME = "WeChatDataService"
+AUTOSTART_WECHAT_POLL_MS = 5000
+AUTOSTART_SERVICE_RETRY_MS = 15000
+AUTOSTART_MAX_SERVICE_RETRIES = 120
 _RE_ACCOUNT_DIR_WITH_SUFFIX = re.compile(r"(.+)_([0-9a-fA-F]{4,})$")
 
 
@@ -268,8 +272,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._state_self_username = ""
         self._stop_requested = False
         self._health_last_ok = False
+        self._service_ever_healthy = False
         self._base_url = ""
         self._did_first_show = False
+        self._autostart_retry_count = 0
+        self._autostart_wait_reason = ""
 
         self._health_pending = False
         self._health_emitter = _HealthEmitter()
@@ -282,6 +289,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._poll_timer.setInterval(1500)
         self._poll_timer.timeout.connect(self._poll_health)
 
+        self._autostart_wait_timer = QtCore.QTimer(self)
+        self._autostart_wait_timer.setInterval(AUTOSTART_WECHAT_POLL_MS)
+        self._autostart_wait_timer.timeout.connect(self._try_autostart_start)
+
         self._build_ui()
         self._apply_theme()
         self._apply_initial_window_geometry()
@@ -289,7 +300,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_autostart_ui()
 
         if self._auto_start_service:
-            QtCore.QTimer.singleShot(200, self.start_service)
+            QtCore.QTimer.singleShot(200, self._begin_autostart_wait)
             QtCore.QTimer.singleShot(300, self._hide_to_tray)
 
     # ---------------- UI ----------------
@@ -452,7 +463,7 @@ class MainWindow(QtWidgets.QMainWindow):
         autostart_l.setContentsMargins(12, 10, 12, 10)
         autostart_l.setSpacing(10)
 
-        self._chk_autostart = QtWidgets.QCheckBox("开机自启（登录后自动后台运行）")
+        self._chk_autostart = QtWidgets.QCheckBox("开机自启（等待微信启动/登录后后台运行）")
         self._chk_autostart.toggled.connect(self.on_toggle_autostart)
         autostart_l.addWidget(self._chk_autostart)
         autostart_l.addStretch(1)
@@ -1142,6 +1153,83 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.clipboard().setText("\n".join(lines))
         QtWidgets.QMessageBox.information(self, "已复制", "已复制诊断信息到剪贴板。")
 
+    # ---------------- Autostart orchestration ----------------
+
+    def _begin_autostart_wait(self):
+        if not self._auto_start_service:
+            return
+        if self._proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return
+        self._try_autostart_start()
+
+    def _set_autostart_waiting(self, reason: str, status_text: str, log_line: str):
+        self._update_status(status_text, ok=False)
+        if self._autostart_wait_reason != reason:
+            self._autostart_wait_reason = reason
+            self._append_log(log_line)
+        if not self._autostart_wait_timer.isActive():
+            self._autostart_wait_timer.start()
+
+    def _try_autostart_start(self):
+        if not self._auto_start_service:
+            return
+        if self._proc.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self._autostart_wait_timer.stop()
+            return
+
+        cfg = load_config_soft(self._config_path)
+        db_dir = (cfg.get("db_dir") or "").strip()
+        if not db_dir or not os.path.isdir(db_dir):
+            self._set_autostart_waiting(
+                "db_dir",
+                "● 等待微信数据目录…",
+                "[gui] autostart: waiting for a valid db_dir",
+            )
+            return
+
+        process_name = (cfg.get("wechat_process") or "").strip()
+        if not is_wechat_running(process_name):
+            label = process_name or "default"
+            self._set_autostart_waiting(
+                "wechat",
+                "● 等待微信启动/登录…",
+                f"[gui] autostart: waiting for WeChat process ({label})",
+            )
+            return
+
+        self._autostart_wait_timer.stop()
+        self._autostart_wait_reason = ""
+        self._append_log("[gui] autostart: WeChat detected; starting service")
+        self.start_service()
+
+    def _schedule_autostart_retry(self, exit_code, was_healthy: bool):
+        if not self._auto_start_service:
+            return
+        if self._stop_requested or was_healthy:
+            return
+
+        self._autostart_retry_count += 1
+        if self._autostart_retry_count > AUTOSTART_MAX_SERVICE_RETRIES:
+            msg = "自启启动失败：微信可能尚未登录、权限不足，或 db_dir 与当前账号不匹配。"
+            self._update_status("● 自启启动失败", ok=False)
+            self._append_log(f"[gui] autostart: retry limit reached after exit_code={exit_code}")
+            try:
+                if self._tray:
+                    self._tray.showMessage(APP_TITLE, msg, QtWidgets.QSystemTrayIcon.MessageIcon.Warning, 8000)
+            except Exception:
+                pass
+            return
+
+        self._update_status(
+            f"● 等待微信就绪…（重试 {self._autostart_retry_count}/{AUTOSTART_MAX_SERVICE_RETRIES}）",
+            ok=False,
+        )
+        self._append_log(
+            f"[gui] autostart: service exited before health check "
+            f"(code={exit_code}); retrying in {AUTOSTART_SERVICE_RETRY_MS // 1000}s"
+        )
+        QtCore.QTimer.singleShot(AUTOSTART_SERVICE_RETRY_MS, self._begin_autostart_wait)
+
     # ---------------- Service ----------------
 
     def start_service(self):
@@ -1154,6 +1242,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._auto_open_web_done = False
         self._stop_requested = False
         self._health_last_ok = False
+        self._service_ever_healthy = False
 
         self.save_config()
         cfg = load_config_soft(self._config_path)
@@ -1374,6 +1463,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _on_proc_finished(self, exit_code, exit_status):
+        was_healthy = bool(self._service_ever_healthy or self._health_last_ok)
         self._poll_timer.stop()
         self._health_last_ok = False
         if self._stop_requested:
@@ -1381,6 +1471,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._update_status(f"● 已退出 (code={exit_code})", ok=False)
         self._append_log(f"[gui] exited: code={exit_code} status={exit_status}")
+        self._schedule_autostart_retry(exit_code, was_healthy)
         self._stop_requested = False
         try:
             self._refresh_quick_cards()
@@ -1407,6 +1498,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._proc.state() != QtCore.QProcess.ProcessState.Running:
             return
         if ok:
+            self._service_ever_healthy = True
+            self._autostart_retry_count = 0
             self._update_status("● 运行中（可达）", ok=True)
             if self._auto_open_web_pending and (not getattr(self, "_auto_open_web_done", False)):
                 self._auto_open_web_done = True
