@@ -360,6 +360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tray = None
         self._setup_tray()
         self._theme = {}
+        self._applying_theme = False
 
         self._state_self_username = ""
         self._stop_requested = False
@@ -412,7 +413,6 @@ class MainWindow(QtWidgets.QMainWindow):
             tracked = {
                 QtCore.QEvent.Type.PaletteChange,
                 QtCore.QEvent.Type.ApplicationPaletteChange,
-                QtCore.QEvent.Type.StyleChange,
             }
             if event_type not in tracked:
                 return
@@ -825,10 +825,14 @@ class MainWindow(QtWidgets.QMainWindow):
         control_l.addStretch(1)
 
     def _apply_theme(self):
-        self._theme = _build_theme_tokens(QtWidgets.QApplication.palette())
-        t = self._theme
-        self.setStyleSheet(
-            f"""
+        if self._applying_theme:
+            return
+        self._applying_theme = True
+        try:
+            self._theme = _build_theme_tokens(QtWidgets.QApplication.palette())
+            t = self._theme
+            self.setStyleSheet(
+                f"""
             QMainWindow, QDialog {{
                 background: {t['window_bg']};
             }}
@@ -955,7 +959,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 border-radius: 4px;
             }}
             """
-        )
+            )
+        finally:
+            self._applying_theme = False
 
     # ---------------- Config ----------------
 
