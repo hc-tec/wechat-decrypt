@@ -9,7 +9,7 @@ from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
 from log_utils import get_current_log_dir, get_current_log_path, init_app_logging, write_log_line
 from qt_compat import QT_LIB, QtCore, QtGui, QtWidgets
-from wechat_status import is_wechat_running
+from wechat_status import build_wechat_not_running_message, is_wechat_running
 
 
 APP_TITLE = "WeChat Data Service"
@@ -79,6 +79,97 @@ def _get_json(url: str, *, timeout: float = 1.5) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def _rgba(color: str, alpha: float) -> str:
+    q = QtGui.QColor(color)
+    if alpha <= 1:
+        a = int(round(max(0.0, min(1.0, float(alpha))) * 255))
+    else:
+        a = int(round(max(0.0, min(255.0, float(alpha)))))
+    return f"rgba({q.red()},{q.green()},{q.blue()},{a})"
+
+
+def _is_dark_palette(palette) -> bool:
+    try:
+        window = palette.color(QtGui.QPalette.ColorRole.Window)
+        text = palette.color(QtGui.QPalette.ColorRole.WindowText)
+        return window.lightnessF() < text.lightnessF()
+    except Exception:
+        return True
+
+
+def _build_theme_tokens(palette) -> dict[str, str]:
+    if _is_dark_palette(palette):
+        accent = "#47b89c"
+        return {
+            "window_bg": "#111417",
+            "surface_bg": "#171c21",
+            "panel_bg": "#171c21",
+            "panel_border": "#2a3138",
+            "text_primary": "#e8edf2",
+            "text_secondary": "#c3ccd8",
+            "text_hint": "#95a3b4",
+            "input_bg": "#20262d",
+            "input_bg_readonly": "#1b2026",
+            "input_border": "#313941",
+            "browser_bg": "#161b21",
+            "tab_bg": "#171c21",
+            "tab_active_bg": "#202830",
+            "tab_hover_bg": "#1c252d",
+            "button_bg": _rgba(accent, 0.16),
+            "button_hover": _rgba(accent, 0.24),
+            "button_pressed": _rgba(accent, 0.14),
+            "button_border": _rgba(accent, 0.52),
+            "button_text": "#e8edf2",
+            "status_ok": "#7ecf96",
+            "status_warn": "#efc06b",
+            "badge_ok_fg": "#82d6a1",
+            "badge_ok_bg": _rgba("#82d6a1", 0.12),
+            "badge_ok_border": _rgba("#82d6a1", 0.38),
+            "badge_err_fg": "#f1a4a4",
+            "badge_err_bg": _rgba("#ef6f6c", 0.12),
+            "badge_err_border": _rgba("#ef6f6c", 0.38),
+            "badge_warn_fg": "#efc06b",
+            "badge_warn_bg": _rgba("#efc06b", 0.12),
+            "badge_warn_border": _rgba("#efc06b", 0.38),
+            "selection_bg": _rgba(accent, 0.42),
+        }
+
+    accent = "#2f9c84"
+    return {
+        "window_bg": "#f4f7f8",
+        "surface_bg": "#ffffff",
+        "panel_bg": "#ffffff",
+        "panel_border": "#d5dde4",
+        "text_primary": "#17212b",
+        "text_secondary": "#526475",
+        "text_hint": "#6e8091",
+        "input_bg": "#fbfcfd",
+        "input_bg_readonly": "#f1f4f7",
+        "input_border": "#cad4dc",
+        "browser_bg": "#f8fafb",
+        "tab_bg": "#edf2f5",
+        "tab_active_bg": "#ffffff",
+        "tab_hover_bg": "#e5edf2",
+        "button_bg": "#dff4ee",
+        "button_hover": "#d1ede5",
+        "button_pressed": "#c2e5db",
+        "button_border": "#79baa9",
+        "button_text": "#175547",
+        "status_ok": "#1f7d5f",
+        "status_warn": "#996400",
+        "badge_ok_fg": "#176a53",
+        "badge_ok_bg": "#e9f7f2",
+        "badge_ok_border": "#98d2c1",
+        "badge_err_fg": "#ad4444",
+        "badge_err_bg": "#fceeee",
+        "badge_err_border": "#e9bbbb",
+        "badge_warn_fg": "#8a5d00",
+        "badge_warn_bg": "#fff4df",
+        "badge_warn_border": "#edcf87",
+        "selection_bg": "#bfe6db",
+    }
 
 
 _Signal = getattr(QtCore, "pyqtSignal", None)
@@ -268,6 +359,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._tray = None
         self._setup_tray()
+        self._theme = {}
 
         self._state_self_username = ""
         self._stop_requested = False
@@ -312,6 +404,27 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._post_show_adjust_geometry)
         else:
             QtCore.QTimer.singleShot(0, self._ensure_within_screen)
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        try:
+            event_type = event.type()
+            tracked = {
+                QtCore.QEvent.Type.PaletteChange,
+                QtCore.QEvent.Type.ApplicationPaletteChange,
+                QtCore.QEvent.Type.StyleChange,
+            }
+            if event_type not in tracked:
+                return
+        except Exception:
+            return
+
+        self._apply_theme()
+        if hasattr(self, "_q_db_badge"):
+            try:
+                self._refresh_quick_cards()
+            except Exception:
+                pass
 
     def _post_show_adjust_geometry(self):
         # 某些环境下（尤其是冻结版/高 DPI），屏幕几何信息在首次 show 前可能不稳定，
@@ -712,53 +825,135 @@ class MainWindow(QtWidgets.QMainWindow):
         control_l.addStretch(1)
 
     def _apply_theme(self):
+        self._theme = _build_theme_tokens(QtWidgets.QApplication.palette())
+        t = self._theme
         self.setStyleSheet(
-            """
-            QMainWindow { background: #0b0d12; }
-            QLabel#title { font-size: 20px; font-weight: 700; color: #e8eaf0; }
-            QLabel#status { font-size: 13px; color: #c7cbe0; }
-            QLabel#hint { color: #9aa3c7; }
-            QGroupBox {
-                color: #e8eaf0;
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 10px;
+            f"""
+            QMainWindow, QDialog {{
+                background: {t['window_bg']};
+            }}
+            QLabel {{
+                color: {t['text_primary']};
+            }}
+            QLabel#title {{
+                font-size: 20px;
+                font-weight: 700;
+                color: {t['text_primary']};
+            }}
+            QLabel#status {{
+                font-size: 13px;
+                color: {t['text_secondary']};
+            }}
+            QLabel#hint {{
+                color: {t['text_hint']};
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {t['panel_border']};
+                border-radius: 8px;
+                background: {t['surface_bg']};
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background: {t['tab_bg']};
+                color: {t['text_secondary']};
+                border: 1px solid {t['panel_border']};
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 8px 12px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background: {t['tab_active_bg']};
+                color: {t['text_primary']};
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: {t['tab_hover_bg']};
+            }}
+            QGroupBox {{
+                color: {t['text_primary']};
+                border: 1px solid {t['panel_border']};
+                border-radius: 8px;
                 margin-top: 10px;
                 padding: 12px;
-                background: rgba(255,255,255,0.03);
-            }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QFrame#card {
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 12px;
-                background: rgba(255,255,255,0.03);
-            }
-            QLabel#cardTitle { font-size: 13px; font-weight: 700; color: #e8eaf0; }
-            QLabel#cardValue { color: #c7cbe0; }
-            QLabel#badge { font-size: 11px; }
-            QLineEdit, QPlainTextEdit, QSpinBox {
-                background: rgba(255,255,255,0.06);
-                border: 1px solid rgba(255,255,255,0.10);
+                background: {t['panel_bg']};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: {t['text_primary']};
+                background: transparent;
+            }}
+            QFrame#card {{
+                border: 1px solid {t['panel_border']};
+                border-radius: 8px;
+                background: {t['panel_bg']};
+            }}
+            QLabel#cardTitle {{
+                font-size: 13px;
+                font-weight: 700;
+                color: {t['text_primary']};
+            }}
+            QLabel#cardValue {{
+                color: {t['text_secondary']};
+            }}
+            QLabel#badge {{
+                font-size: 11px;
+            }}
+            QLineEdit, QPlainTextEdit, QSpinBox {{
+                background: {t['input_bg']};
+                border: 1px solid {t['input_border']};
                 border-radius: 8px;
                 padding: 7px;
-                color: #e8eaf0;
-            }
-            QTextBrowser {
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.08);
+                color: {t['text_primary']};
+                selection-background-color: {t['selection_bg']};
+            }}
+            QLineEdit:read-only, QPlainTextEdit:read-only {{
+                background: {t['input_bg_readonly']};
+                color: {t['text_secondary']};
+            }}
+            QTextBrowser {{
+                background: {t['browser_bg']};
+                border: 1px solid {t['input_border']};
                 border-radius: 8px;
                 padding: 10px;
-                color: #e8eaf0;
-            }
-            QPushButton {
-                background: rgba(79,195,247,0.14);
-                border: 1px solid rgba(79,195,247,0.35);
+                color: {t['text_primary']};
+            }}
+            QPushButton {{
+                background: {t['button_bg']};
+                border: 1px solid {t['button_border']};
                 border-radius: 8px;
                 padding: 8px 12px;
-                color: #e8eaf0;
-            }
-            QPushButton:hover { background: rgba(79,195,247,0.20); }
-            QPushButton:pressed { background: rgba(79,195,247,0.12); }
-            QCheckBox { color: #e8eaf0; }
+                color: {t['button_text']};
+            }}
+            QPushButton:hover {{
+                background: {t['button_hover']};
+            }}
+            QPushButton:pressed {{
+                background: {t['button_pressed']};
+            }}
+            QPushButton:disabled {{
+                color: {t['text_hint']};
+            }}
+            QCheckBox {{
+                color: {t['text_primary']};
+                spacing: 6px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+            }}
+            QCheckBox::indicator:unchecked {{
+                background: {t['input_bg']};
+                border: 1px solid {t['input_border']};
+                border-radius: 4px;
+            }}
+            QCheckBox::indicator:checked {{
+                background: {t['button_border']};
+                border: 1px solid {t['button_border']};
+                border-radius: 4px;
+            }}
             """
         )
 
@@ -875,21 +1070,22 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.exec()
 
     def _set_badge(self, label: QtWidgets.QLabel, *, state: str, text: str) -> None:
+        t = self._theme or _build_theme_tokens(QtWidgets.QApplication.palette())
         label.setText(text or "")
         if state == "ok":
             label.setStyleSheet(
-                "QLabel{color:#81c784;background:rgba(129,199,132,0.10);"
-                "border:1px solid rgba(129,199,132,0.35);border-radius:999px;padding:2px 10px;}"
+                f"QLabel{{color:{t['badge_ok_fg']};background:{t['badge_ok_bg']};"
+                f"border:1px solid {t['badge_ok_border']};border-radius:999px;padding:2px 10px;}}"
             )
         elif state == "err":
             label.setStyleSheet(
-                "QLabel{color:#ef9a9a;background:rgba(244,67,54,0.10);"
-                "border:1px solid rgba(244,67,54,0.35);border-radius:999px;padding:2px 10px;}"
+                f"QLabel{{color:{t['badge_err_fg']};background:{t['badge_err_bg']};"
+                f"border:1px solid {t['badge_err_border']};border-radius:999px;padding:2px 10px;}}"
             )
         else:
             label.setStyleSheet(
-                "QLabel{color:#ffb74d;background:rgba(255,183,77,0.10);"
-                "border:1px solid rgba(255,183,77,0.35);border-radius:999px;padding:2px 10px;}"
+                f"QLabel{{color:{t['badge_warn_fg']};background:{t['badge_warn_bg']};"
+                f"border:1px solid {t['badge_warn_border']};border-radius:999px;padding:2px 10px;}}"
             )
 
     def _short_path(self, p: str, max_len: int = 64) -> str:
@@ -1250,6 +1446,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not db_dir or not os.path.isdir(db_dir):
             QtWidgets.QMessageBox.warning(self, "配置不完整", "db_dir 无效，请先选择微信 db_storage 目录。")
             return
+        if (not self._auto_start_service) and (not is_wechat_running(cfg.get("wechat_process"))):
+            self._update_status("● 等待微信启动/登录…", ok=False)
+            QtWidgets.QMessageBox.information(
+                self,
+                "请先打开微信",
+                build_wechat_not_running_message(cfg.get("wechat_process")),
+            )
+            return
 
         env = QtCore.QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUTF8", "1")
@@ -1523,8 +1727,9 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- helpers ----------------
 
     def _update_status(self, text: str, ok: bool):
+        t = self._theme or _build_theme_tokens(QtWidgets.QApplication.palette())
         self._status.setText(text)
-        color = "#81c784" if ok else "#ffb74d"
+        color = t["status_ok"] if ok else t["status_warn"]
         self._status.setStyleSheet(f"color: {color};")
 
     def _append_log(self, line: str, *, tag: str = "gui"):

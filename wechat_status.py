@@ -103,3 +103,12 @@ def is_wechat_running(configured_process: str | None = None) -> bool:
             if _pgrep_process_running(name):
                 return True
     return False
+
+
+def build_wechat_not_running_message(configured_process: str | None = None) -> str:
+    configured = os.path.basename((configured_process or "").strip().strip('"'))
+    display = configured or "Weixin.exe / WeChat.exe"
+    msg = f"未检测到微信进程（{display}）。\n请先启动微信并登录，再启动服务。"
+    if configured and configured.lower() not in {"weixin", "weixin.exe", "wechat", "wechat.exe"}:
+        msg += "\n如果你的微信进程名配置不对，请在 config.json 的 wechat_process 中修正。"
+    return msg

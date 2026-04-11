@@ -99,6 +99,11 @@ class ConfigAndAutostartTests(unittest.TestCase):
         self.assertFalse(wechat_status._windows_tasklist_contains(output, "WeChat.exe"))
         self.assertFalse(wechat_status._windows_tasklist_contains("INFO: No tasks are running\n", "Weixin.exe"))
 
+    def test_build_wechat_not_running_message_mentions_process(self):
+        msg = wechat_status.build_wechat_not_running_message("CustomWeChat.exe")
+        self.assertIn("CustomWeChat.exe", msg)
+        self.assertIn("wechat_process", msg)
+
 
 if __name__ == "__main__":
     unittest.main()
