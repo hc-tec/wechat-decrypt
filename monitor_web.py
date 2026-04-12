@@ -21,6 +21,11 @@ from decode_voice import decode_voice_bytes_to_wav
 from key_utils import get_key_info, strip_key_metadata
 from persona_store import PersonaStore
 from chat_history import parse_group_sender_content, query_chat_history
+from service_runtime import (
+    SERVICE_EXIT_PORT_CONFLICT,
+    build_port_conflict_message,
+    is_address_in_use_error,
+)
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -3518,7 +3523,13 @@ def main():
     t = threading.Thread(target=monitor_thread, args=(enc_key, session_db, contact_names, db_cache, username_db_map), daemon=True)
     t.start()
 
-    server = ThreadedServer((LISTEN_HOST, PORT), Handler)
+    try:
+        server = ThreadedServer((LISTEN_HOST, PORT), Handler)
+    except OSError as e:
+        if is_address_in_use_error(e):
+            print(f"[ERROR] {build_port_conflict_message(LISTEN_HOST, PORT)}", flush=True)
+            sys.exit(SERVICE_EXIT_PORT_CONFLICT)
+        raise
     url_host = "localhost" if LISTEN_HOST in ("0.0.0.0", "127.0.0.1", "::") else LISTEN_HOST
     print(f"\n=> http://{url_host}:{PORT}", flush=True)
     print("Ctrl+C 停止\n", flush=True)

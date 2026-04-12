@@ -12,6 +12,14 @@ import functools
 print = functools.partial(print, flush=True)
 
 from key_utils import strip_key_metadata
+from service_runtime import (
+    SERVICE_EXIT_ALREADY_RUNNING,
+    SERVICE_EXIT_PORT_CONFLICT,
+    ServiceInstanceGuard,
+    build_port_conflict_message,
+    build_service_already_running_message,
+    probe_local_service_state,
+)
 from wechat_status import is_wechat_running
 
 
@@ -84,37 +92,59 @@ def main():
     # 1. 加载配置（自动检测 db_dir）
     from config import load_config
     cfg = load_config()
-
-    # 2. 检查微信进程
-    if not check_wechat_running(cfg.get("wechat_process")):
-        print(f"[!] 未检测到微信进程 ({cfg.get('wechat_process', 'WeChat')})")
-        print("    请先启动微信并登录，然后重新运行")
-        sys.exit(1)
-    print("[+] 微信进程运行中")
-
-    # 3. 提取密钥
-    ensure_keys(cfg["keys_file"], cfg["db_dir"])
-
-    # 4. 根据子命令执行
     cmd = sys.argv[1] if len(sys.argv) > 1 else "web"
 
-    if cmd == "decrypt":
-        print("[*] 开始解密全部数据库...")
-        print()
-        from decrypt_db import main as decrypt_all
-        decrypt_all()
-    elif cmd == "web":
-        print("[*] 启动 Web UI...")
-        print()
-        from monitor_web import main as start_web
-        start_web()
-    else:
-        print(f"[!] 未知命令: {cmd}")
-        print()
-        print("用法:")
-        print("  python main.py          启动实时消息监听 (Web UI)")
-        print("  python main.py decrypt  解密全部数据库到 decrypted/")
-        sys.exit(1)
+    service_guard = None
+    if cmd == "web":
+        state = probe_local_service_state(cfg.get("listen_host"), cfg.get("listen_port", 5678))
+        if state == "service":
+            print(f"[!] {build_service_already_running_message(cfg.get('listen_host'), cfg.get('listen_port', 5678))}")
+            sys.exit(SERVICE_EXIT_ALREADY_RUNNING)
+        if state == "occupied":
+            print(f"[!] {build_port_conflict_message(cfg.get('listen_host'), cfg.get('listen_port', 5678))}")
+            sys.exit(SERVICE_EXIT_PORT_CONFLICT)
+
+        service_guard = ServiceInstanceGuard(
+            cfg.get("listen_host"),
+            cfg.get("listen_port", 5678),
+            config_path=os.environ.get("WECHAT_DECRYPT_CONFIG", ""),
+        )
+        if not service_guard.acquire():
+            print(f"[!] {build_service_already_running_message(cfg.get('listen_host'), cfg.get('listen_port', 5678))}")
+            sys.exit(SERVICE_EXIT_ALREADY_RUNNING)
+
+    try:
+        # 2. 检查微信进程
+        if not check_wechat_running(cfg.get("wechat_process")):
+            print(f"[!] 未检测到微信进程 ({cfg.get('wechat_process', 'WeChat')})")
+            print("    请先启动微信并登录，然后重新运行")
+            sys.exit(1)
+        print("[+] 微信进程运行中")
+
+        # 3. 提取密钥
+        ensure_keys(cfg["keys_file"], cfg["db_dir"])
+
+        # 4. 根据子命令执行
+        if cmd == "decrypt":
+            print("[*] 开始解密全部数据库...")
+            print()
+            from decrypt_db import main as decrypt_all
+            decrypt_all()
+        elif cmd == "web":
+            print("[*] 启动 Web UI...")
+            print()
+            from monitor_web import main as start_web
+            start_web()
+        else:
+            print(f"[!] 未知命令: {cmd}")
+            print()
+            print("用法:")
+            print("  python main.py          启动实时消息监听 (Web UI)")
+            print("  python main.py decrypt  解密全部数据库到 decrypted/")
+            sys.exit(1)
+    finally:
+        if service_guard is not None:
+            service_guard.release()
 
 
 if __name__ == "__main__":

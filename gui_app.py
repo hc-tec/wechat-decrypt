@@ -4,11 +4,19 @@ import json
 import urllib.request
 import re
 import threading
+import hashlib
 
 from autostart import get_run_command, set_autostart_enabled
 from config import get_config_path, load_config_soft, read_config_file, write_config_file
 from log_utils import get_current_log_dir, get_current_log_path, init_app_logging, write_log_line
 from qt_compat import QT_LIB, QtCore, QtGui, QtWidgets
+from service_runtime import (
+    SERVICE_EXIT_ALREADY_RUNNING,
+    SERVICE_EXIT_PORT_CONFLICT,
+    build_port_conflict_message,
+    build_service_already_running_message,
+    probe_local_service_state,
+)
 from wechat_status import build_wechat_not_running_message, is_wechat_running
 
 
@@ -79,6 +87,39 @@ def _get_json(url: str, *, timeout: float = 1.5) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def _build_single_instance_mutex_name(config_path: str) -> str:
+    key = APP_TITLE.lower().encode("utf-8", errors="ignore")
+    digest = hashlib.sha1(key).hexdigest()
+    return f"Local\\WeChatDataServiceGUI_{digest}"
+
+
+def _acquire_single_instance_guard(config_path: str):
+    if not sys.platform.startswith("win"):
+        return None, True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, _build_single_instance_mutex_name(config_path))
+        if not handle:
+            return None, True
+        already_exists = int(kernel32.GetLastError()) == 183  # ERROR_ALREADY_EXISTS
+        return handle, (not already_exists)
+    except Exception:
+        return None, True
+
+
+def _release_single_instance_guard(handle) -> None:
+    if not handle or not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
 
 
 def _rgba(color: str, alpha: float) -> str:
@@ -366,6 +407,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_requested = False
         self._health_last_ok = False
         self._service_ever_healthy = False
+        self._external_service_state = "free"
         self._base_url = ""
         self._did_first_show = False
         self._autostart_retry_count = 0
@@ -1009,6 +1051,7 @@ class MainWindow(QtWidgets.QMainWindow):
         url_host = "localhost" if host in ("0.0.0.0", "127.0.0.1", "::") else host
         self._base_url = f"http://{url_host}:{port}"
 
+        self._refresh_external_service_state()
         self._refresh_quick_cards()
 
     def _refresh_image_key_status(self, cfg: dict | None = None) -> None:
@@ -1030,6 +1073,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._img_key_status.setText(f"已配置（AES={masked}）")
         else:
             self._img_key_status.setText("未配置：若需要在调试页/接口中解析图片，请点“图片密钥…”")
+
+    def _refresh_external_service_state(self) -> str:
+        if self._proc.state() == QtCore.QProcess.ProcessState.Running:
+            self._external_service_state = "own"
+            return "own"
+
+        cfg = self._cfg or {}
+        state = probe_local_service_state(cfg.get("listen_host"), cfg.get("listen_port", 5678))
+        self._external_service_state = state
+        return state
 
     def set_image_keys(self, aes_key: str, xor_key: int | None) -> None:
         aes_key = (aes_key or "").strip()
@@ -1114,24 +1167,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._q_db_value.setText(db_hint)
         self._set_badge(self._q_db_badge, state=("ok" if db_ok else "warn"), text=("已选择" if db_ok else "未选择"))
 
-        running = self._proc.state() == QtCore.QProcess.ProcessState.Running
-        reachable = bool(self._health_last_ok) if running else False
+        own_running = self._proc.state() == QtCore.QProcess.ProcessState.Running
+        external_running = (self._external_service_state == "service") if not own_running else False
+        port_conflict = (self._external_service_state == "occupied") if not own_running else False
+        reachable = bool(self._health_last_ok) if own_running else external_running
         base_url = (self._base_url or "").strip()
-        self._q_svc_value.setText("运行中" if reachable else ("启动中…" if running else "未启动"))
-        if reachable:
+        if own_running and reachable:
+            self._q_svc_value.setText("运行中")
             self._set_badge(self._q_svc_badge, state="ok", text="运行中")
-        elif running:
+        elif own_running:
+            self._q_svc_value.setText("启动中…")
             self._set_badge(self._q_svc_badge, state="warn", text="不可达")
+        elif external_running:
+            self._q_svc_value.setText("已由其他窗口/进程启动")
+            self._set_badge(self._q_svc_badge, state="ok", text="已运行")
+        elif port_conflict:
+            self._q_svc_value.setText("端口已被其他程序占用")
+            self._set_badge(self._q_svc_badge, state="err", text="端口冲突")
         else:
+            self._q_svc_value.setText("未启动")
             self._set_badge(self._q_svc_badge, state="warn", text="未启动")
 
         try:
-            self._q_svc_btn.setText("停止" if running else "启动")
+            self._q_svc_btn.setText("停止" if own_running else "启动")
         except Exception:
             pass
 
         self._q_url_value.setText(base_url or "-")
-        self._set_badge(self._q_url_badge, state=("ok" if reachable else "warn"), text=("可达" if reachable else "待启动"))
+        if reachable:
+            self._set_badge(self._q_url_badge, state="ok", text="可达")
+        elif port_conflict:
+            self._set_badge(self._q_url_badge, state="err", text="冲突")
+        else:
+            self._set_badge(self._q_url_badge, state="warn", text="待启动")
 
         detected_u = (self._state_self_username or "").strip()
         override_u = (cfg.get("self_username") or "").strip()
@@ -1344,6 +1412,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"service_console_log={service_console}",
             f"service_exe={service_exe}",
             f"service_running={running}",
+            f"endpoint_state={self._external_service_state}",
             f"listen={host}:{port}",
             f"base_url={base_url}",
             f"db_dir={db_dir}",
@@ -1409,6 +1478,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self._stop_requested or was_healthy:
             return
+        if exit_code == SERVICE_EXIT_ALREADY_RUNNING:
+            self._refresh_external_service_state()
+            self._update_status("● 运行中（已有服务）", ok=True)
+            return
+        if exit_code == SERVICE_EXIT_PORT_CONFLICT:
+            self._refresh_external_service_state()
+            msg = build_port_conflict_message(self._cfg.get("listen_host"), self._cfg.get("listen_port", 5678))
+            self._update_status("● 端口被占用", ok=False)
+            try:
+                if self._tray:
+                    self._tray.showMessage(APP_TITLE, msg, QtWidgets.QSystemTrayIcon.MessageIcon.Warning, 8000)
+            except Exception:
+                pass
+            return
 
         self._autostart_retry_count += 1
         if self._autostart_retry_count > AUTOSTART_MAX_SERVICE_RETRIES:
@@ -1451,6 +1534,39 @@ class MainWindow(QtWidgets.QMainWindow):
         db_dir = (cfg.get("db_dir") or "").strip()
         if not db_dir or not os.path.isdir(db_dir):
             QtWidgets.QMessageBox.warning(self, "配置不完整", "db_dir 无效，请先选择微信 db_storage 目录。")
+            return
+        endpoint_state = self._refresh_external_service_state()
+        if endpoint_state == "service":
+            self._update_status("● 运行中（已有服务）", ok=True)
+            try:
+                self._refresh_quick_cards()
+            except Exception:
+                pass
+            msg = build_service_already_running_message(cfg.get("listen_host"), cfg.get("listen_port", 5678))
+            if self._auto_start_service:
+                try:
+                    if self._tray:
+                        self._tray.showMessage(APP_TITLE, msg, QtWidgets.QSystemTrayIcon.MessageIcon.Information, 5000)
+                except Exception:
+                    pass
+            else:
+                QtWidgets.QMessageBox.information(self, "服务已在运行", msg)
+            return
+        if endpoint_state == "occupied":
+            self._update_status("● 端口被占用", ok=False)
+            try:
+                self._refresh_quick_cards()
+            except Exception:
+                pass
+            msg = build_port_conflict_message(cfg.get("listen_host"), cfg.get("listen_port", 5678))
+            if self._auto_start_service:
+                try:
+                    if self._tray:
+                        self._tray.showMessage(APP_TITLE, msg, QtWidgets.QSystemTrayIcon.MessageIcon.Warning, 8000)
+                except Exception:
+                    pass
+            else:
+                QtWidgets.QMessageBox.warning(self, "启动失败", msg)
             return
         if (not self._auto_start_service) and (not is_wechat_running(cfg.get("wechat_process"))):
             self._update_status("● 等待微信启动/登录…", ok=False)
@@ -1508,6 +1624,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def stop_service(self):
         if self._proc.state() == QtCore.QProcess.ProcessState.NotRunning:
+            endpoint_state = self._refresh_external_service_state()
+            if endpoint_state == "service":
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "无法停止",
+                    "检测到服务已由其他 GUI 窗口或外部进程启动。\n请回到启动它的窗口，或手动结束 WeChatDataService.exe。",
+                )
+            elif endpoint_state == "occupied":
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "无法停止",
+                    "当前端口被其他程序占用，但它不是本服务。\n请先关闭占用端口的程序。",
+                )
             return
         self._stop_requested = True
         self._append_log("[gui] stop requested")
@@ -1676,11 +1805,36 @@ class MainWindow(QtWidgets.QMainWindow):
         was_healthy = bool(self._service_ever_healthy or self._health_last_ok)
         self._poll_timer.stop()
         self._health_last_ok = False
+        self._refresh_external_service_state()
         if self._stop_requested:
             self._update_status("● 已停止", ok=False)
+        elif exit_code == SERVICE_EXIT_ALREADY_RUNNING:
+            self._update_status("● 运行中（已有服务）", ok=True)
         else:
-            self._update_status(f"● 已退出 (code={exit_code})", ok=False)
+            if exit_code == SERVICE_EXIT_PORT_CONFLICT:
+                self._update_status("● 端口被占用", ok=False)
+            else:
+                self._update_status(f"● 已退出 (code={exit_code})", ok=False)
         self._append_log(f"[gui] exited: code={exit_code} status={exit_status}")
+        if (not self._stop_requested) and (not self._auto_start_service):
+            if exit_code == SERVICE_EXIT_ALREADY_RUNNING:
+                try:
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        "服务已在运行",
+                        build_service_already_running_message(self._cfg.get("listen_host"), self._cfg.get("listen_port", 5678)),
+                    )
+                except Exception:
+                    pass
+            elif exit_code == SERVICE_EXIT_PORT_CONFLICT:
+                try:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "端口冲突",
+                        build_port_conflict_message(self._cfg.get("listen_host"), self._cfg.get("listen_port", 5678)),
+                    )
+                except Exception:
+                    pass
         self._schedule_autostart_retry(exit_code, was_healthy)
         self._stop_requested = False
         try:
@@ -1753,13 +1907,28 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(argv or sys.argv[1:])
     auto = "--autostart" in argv
 
-    init_app_logging("gui", config_path=get_config_path())
+    config_path = get_config_path()
+    init_app_logging("gui", config_path=config_path)
 
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
-    win = MainWindow(auto_start_service=auto)
-    win.show()
-    return int(app.exec())
+    single_guard, acquired = _acquire_single_instance_guard(config_path)
+    if not acquired:
+        if not auto:
+            QtWidgets.QMessageBox.information(
+                None,
+                "已在运行",
+                f"{APP_TITLE} 已在运行。\n请在任务栏或系统托盘中找到现有窗口。",
+            )
+        _release_single_instance_guard(single_guard)
+        return 0
+
+    try:
+        win = MainWindow(auto_start_service=auto)
+        win.show()
+        return int(app.exec())
+    finally:
+        _release_single_instance_guard(single_guard)
 
 
 class ImageKeyWizard(QtWidgets.QDialog):
